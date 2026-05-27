@@ -67,15 +67,115 @@ Total: ~199M | Active per token: ~65M | Utilization: 32.4%
 ### 1. 环境配置
 
 ```bash
-git clone https://github.com/L-0915/DEEP-SLEEP.git
-cd DEEP-SLEEP
+git clone https://github.com/L-0915/deepsleep-replace.git
+cd deepsleep-replace
 
 conda create -n deepsleep python=3.10 -y
 conda activate deepsleep
 pip install -r requirements.txt
 ```
 
-### 2. 训练 Tokenizer
+### 2. 下载模型权重
+
+模型权重托管在 [ModelScope (魔搭)](https://www.modelscope.cn/models/shephub/deepsleep)，按以下目录结构放置：
+
+```
+deepsleep-replace/
+├── out/
+│   ├── pretrain/final/model.pth          # deepsleep-pretrain.pth
+│   ├── cpt/final/model.pth               # deepsleep-cpt.pth
+│   ├── sft/final_model.pth               # deepsleep-sft.pth
+│   ├── sft_qwen/final_model/model.safetensors  # qwen-sft.safetensors
+│   ├── ds_b0.1_hf/model.safetensors      # deepsleep-dpo-b0.1-hf.safetensors
+│   └── ds_b0.5_hf/model.safetensors      # deepsleep-dpo-b0.5-hf.safetensors
+├── dpo_exp/                               # DPO 实验模型（按需下载）
+│   ├── ds_b0.1_s42/final_model.pth
+│   ├── ds_b0.5_s42/final_model.pth
+│   ├── qwen_b0.1_s42/final_model/model.safetensors
+│   ├── qwen_b0.5_s42/final_model/model.safetensors
+│   └── ...（共12个DPO模型）
+```
+
+**方式一：使用 modelscope SDK 下载**
+
+```bash
+pip install modelscope
+python -c "
+from modelscope.hub.snapshot_download import snapshot_download
+snapshot_download('shephub/deepsleep', cache_dir='./model_weights')
+"
+# 然后将下载的文件按上述目录结构复制
+```
+
+**方式二：手动下载**
+
+访问 https://www.modelscope.cn/models/shephub/deepsleep/files 逐个下载，放到对应目录。
+
+> **最少只需下载** `deepsleep-sft.pth` 即可运行 Gradio 演示。如需完整 4 模型对话，还需下载 `ds_b0.1_hf/`、`ds_b0.5_hf/`、`qwen_b0.1_s42/final_model/`、`qwen_b0.5_s42/final_model/`。
+
+### 3. 使用方式
+
+#### 方式 A：Gradio 简易对话（推荐快速体验）
+
+```bash
+python app.py --model out/sft/final_model.pth
+# 浏览器打开 http://localhost:6006
+```
+
+#### 方式 B：React + FastAPI 全功能对话（4模型切换 + 流式输出）
+
+**后端启动：**
+
+```bash
+# 安装后端额外依赖
+pip install fastapi uvicorn sse-starlette
+
+# 修改 server.py 中 MODEL_CONFIGS 的 path 为你的模型路径
+# 然后启动后端
+python server.py --host 0.0.0.0 --port 7860
+```
+
+**前端启动：**
+
+```bash
+cd web
+
+# 安装依赖
+npm install
+
+# 开发模式
+npm run dev
+# 浏览器打开 http://localhost:5173
+
+# 或构建生产版本
+npm run build
+# 构建产物在 web/dist/，启动 server.py 后会自动托管前端
+```
+
+#### 方式 C：命令行推理
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# 加载 DeepSleep HF 格式模型
+model_path = "out/ds_b0.5_hf/"
+tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.float16)
+model.cuda().eval()
+
+messages = [
+    {"role": "system", "content": "你是星辰曦（小曦），一个温暖有趣的睡眠健康伙伴。"},
+    {"role": "user", "content": "失眠了怎么办？"},
+]
+text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tokenizer(text, return_tensors="pt").to("cuda")
+with torch.no_grad():
+    out = model.generate(**inputs, max_new_tokens=256, temperature=0.7, top_p=0.9, do_sample=True)
+print(tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True))
+```
+
+### 4. 训练 Tokenizer
 
 ```bash
 # 从 CCI4.0-HQ 流式加载中英文语料训练 BPE tokenizer

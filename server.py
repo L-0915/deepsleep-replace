@@ -230,7 +230,7 @@ class ModelManager:
     async def _generate_deepsleep(
         self, model, tokenizer, messages, thinking, temperature, top_p, max_tokens, max_ctx
     ) -> AsyncGenerator[dict, None]:
-        """DeepSleep 模型推理：ChatML 格式 + threading/queue 流式"""
+        """DeepSleep 模型推理：逐 token 流式输出"""
 
         # 构建 system prompt
         system_content = SYSTEM_PROMPT
@@ -262,8 +262,6 @@ class ModelManager:
         # tokenize
         enc = tokenizer(prompt_text, add_special_tokens=False)
         input_ids_list = enc["input_ids"]
-
-        # 加 bos_token_id
         bos_id = tokenizer.bos_token_id
         if bos_id is not None:
             input_ids_list = [bos_id] + input_ids_list
@@ -271,45 +269,31 @@ class ModelManager:
         input_ids = torch.tensor([input_ids_list], device=self.device)
         prompt_tokens = input_ids.shape[1]
 
-        # 用 queue + threading 实现异步流式
+        # queue: 每个元素是一个增量文本片段 (str) 或 None (结束)
         q: queue.Queue = queue.Queue()
         error_holder: list = [None]
 
         def _generate_thread():
-            """在线程中运行 model.generate()，逐 token 放入 queue"""
+            """逐 token 生成，立即 decode 并推送全量文本（主线程算增量）"""
             try:
                 generated_ids = []
-                # 使用 model 自定义 generate（支持 past_key_values 和 streamer）
-                # DeepSleep 模型的 generate 不兼容 TextIteratorStreamer，手动逐 token
                 past_kv = None
                 cur_ids = input_ids
 
                 with torch.no_grad():
                     for step in range(max_tokens):
                         if past_kv is None:
-                            # 第一次: 完整 forward
-                            outputs = model(
-                                input_ids=cur_ids,
-                                use_cache=True,
-                            )
+                            outputs = model(input_ids=cur_ids, use_cache=True)
                         else:
-                            # 后续: 只送最后一个 token
-                            outputs = model(
-                                input_ids=cur_ids[:, -1:],
-                                past_key_values=past_kv,
-                                use_cache=True,
-                            )
+                            outputs = model(input_ids=cur_ids[:, -1:], past_key_values=past_kv, use_cache=True)
 
                         logits = outputs.logits[:, -1, :]
                         past_kv = outputs.past_key_values
 
-                        # temperature + top_p 采样
                         logits = logits / max(temperature, 1e-8)
                         if top_p < 1.0:
                             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                            cumulative_probs = torch.cumsum(
-                                torch.softmax(sorted_logits, dim=-1), dim=-1
-                            )
+                            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
                             mask = cumulative_probs > top_p
                             mask[..., 1:] = mask[..., :-1].clone()
                             mask[..., 0] = False
@@ -319,111 +303,83 @@ class ModelManager:
                         probs = torch.softmax(logits, dim=-1)
                         next_token = torch.multinomial(probs, num_samples=1)
 
-                        # 检查 EOS
                         eos_id = tokenizer.eos_token_id
                         if eos_id is not None and next_token.item() == eos_id:
-                            # 放入结束标记
                             q.put(None)
                             return
 
-                        generated_ids.append(next_token.item())
+                        tid = next_token.item()
+                        generated_ids.append(tid)
                         cur_ids = torch.cat([cur_ids, next_token], dim=-1)
 
-                        # 每生成一个 token，decode 并放入 queue
-                        token_text = tokenizer.decode(
-                            generated_ids[-1:], skip_special_tokens=False
-                        )
-                        # 使用累积 decode 避免截断问题
-                        if step % 3 == 0 or step < 5:
-                            # 定期用累积方式刷新，确保多字节字符正确
-                            full_so_far = tokenizer.decode(
-                                generated_ids, skip_special_tokens=False
-                            )
-                            q.put(("full", full_so_far))
-                        else:
-                            q.put(("token", token_text))
+                        # 逐 token 全量 decode，主线程通过比较算增量
+                        q.put(tokenizer.decode(generated_ids, skip_special_tokens=True))
 
-                # 生成完毕
                 q.put(None)
             except Exception as e:
                 error_holder[0] = str(e)
                 q.put(None)
 
-        # 启动生成线程
         t = threading.Thread(target=_generate_thread, daemon=True)
         t.start()
 
-        # 解析 thinking 和 content 标签
-        full_text = ""
-        prev_sent_len = 0
-        think_tag_sent = False
-        content_tag_sent = False
+        # 解析 thinking/content，逐 token 推送
+        last_text = ""
+        phase = "content"
 
         try:
             while True:
-                # 在事件循环中等待 queue
                 item = await asyncio.get_event_loop().run_in_executor(None, q.get)
                 if item is None:
                     break
-
                 if error_holder[0] is not None:
                     yield {"type": "error", "content": error_holder[0]}
                     return
 
-                kind, text = item
-                if kind == "full":
-                    full_text = text
-                else:
-                    full_text += text
+                full_text: str = item
+                if len(full_text) <= len(last_text):
+                    continue
+                delta = full_text[len(last_text):]
+                last_text = full_text
 
-                # 解析 <thinking>...</thinking> 标签
-                cleaned = clean_decode(full_text)
-
-                # 检查是否处于 thinking 阶段
-                think_open = cleaned.find("<thinking>")
-                think_close = cleaned.find("</thinking>")
-
-                if think_open != -1 and think_close == -1:
-                    # 正在 thinking 中
-                    if not think_tag_sent:
-                        think_tag_sent = True
-                    thinking_content = cleaned[think_open + len("<thinking>"):]
-                    # 只发送新增部分
-                    if len(thinking_content) > prev_sent_len:
-                        delta = thinking_content[prev_sent_len:]
-                        prev_sent_len = len(thinking_content)
-                        yield {"type": "thinking", "content": delta}
-
-                elif think_close != -1:
-                    # thinking 结束，切换到 content 阶段
-                    if think_tag_sent and not content_tag_sent:
-                        # 发送 thinking 最后一部分
-                        thinking_content = cleaned[think_open + len("<thinking>"):think_close]
-                        if len(thinking_content) > prev_sent_len:
-                            delta = thinking_content[prev_sent_len:]
-                            yield {"type": "thinking", "content": delta}
-                        content_tag_sent = True
-                        prev_sent_len = 0
-
-                    if content_tag_sent:
-                        # content 阶段
-                        content_text = cleaned[think_close + len("</thinking>"):]
-                        if len(content_text) > prev_sent_len:
-                            delta = content_text[prev_sent_len:]
-                            prev_sent_len = len(content_text)
-                            yield {"type": "content", "content": delta}
-
-                else:
-                    # 没有 thinking 标签，直接输出为 content
-                    if len(cleaned) > prev_sent_len:
-                        delta = cleaned[prev_sent_len:]
-                        prev_sent_len = len(cleaned)
+                if phase == "content":
+                    think_idx = full_text.find("<thinking>")
+                    if think_idx != -1:
+                        phase = "thinking"
+                        before = full_text[:think_idx].strip()
+                        if before:
+                            yield {"type": "content", "content": before}
+                        # delta 中 thinking> 之后的部分作为 thinking 开始
+                        tag_in_delta = delta.find("<thinking>")
+                        if tag_in_delta != -1:
+                            think_delta = delta[tag_in_delta + len("<thinking>"):]
+                            if think_delta:
+                                yield {"type": "thinking", "content": think_delta}
+                    else:
                         yield {"type": "content", "content": delta}
+
+                elif phase == "thinking":
+                    close_idx = full_text.find("</thinking>")
+                    if close_idx == -1:
+                        yield {"type": "thinking", "content": delta}
+                    else:
+                        phase = "thinking_done"
+                        # delta 中 </thinking> 之前的部分仍是 thinking
+                        tag_in_delta = delta.find("</thinking>")
+                        think_delta = delta[:tag_in_delta] if tag_in_delta != -1 else ""
+                        if think_delta:
+                            yield {"type": "thinking", "content": think_delta}
+                        content_delta = delta[tag_in_delta + len("</thinking>"):] if tag_in_delta != -1 else delta
+                        if content_delta:
+                            yield {"type": "content", "content": content_delta}
+
+                elif phase == "thinking_done":
+                    yield {"type": "content", "content": delta}
 
         finally:
             t.join(timeout=5)
 
-        completion_tokens = len(tokenizer.encode(full_text))
+        completion_tokens = len(generated_ids) if generated_ids else len(tokenizer.encode(last_text))
         yield {
             "type": "done",
             "usage": {
@@ -439,12 +395,10 @@ class ModelManager:
     ) -> AsyncGenerator[dict, None]:
         """Qwen 模型推理：apply_chat_template + TextIteratorStreamer"""
 
-        # 构建 system prompt
         system_content = SYSTEM_PROMPT
         if thinking:
             system_content += THINKING_SUFFIX
 
-        # 替换 messages 中的 system
         processed = []
         has_system = False
         for m in messages:
@@ -456,16 +410,13 @@ class ModelManager:
         if not has_system:
             processed.insert(0, {"role": "system", "content": system_content})
 
-        # 截断
         processed = self._truncate_messages(processed, tokenizer, max_ctx)
 
-        # 构建 prompt
         try:
             prompt = tokenizer.apply_chat_template(
                 processed, tokenize=False, add_generation_prompt=True
             )
         except Exception:
-            # fallback
             prompt_parts = []
             for m in processed:
                 prompt_parts.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n")
@@ -475,7 +426,6 @@ class ModelManager:
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[1]
 
-        # TextIteratorStreamer
         streamer = TextIteratorStreamer(
             tokenizer, skip_prompt=True, skip_special_tokens=True
         )
@@ -492,7 +442,6 @@ class ModelManager:
             "eos_token_id": tokenizer.eos_token_id,
         }
 
-        # 在线程中生成
         def _generate():
             with torch.no_grad():
                 model.generate(**gen_kwargs)
@@ -500,82 +449,36 @@ class ModelManager:
         t = threading.Thread(target=_generate, daemon=True)
         t.start()
 
-        # 解析 thinking/content
+        # 逐 chunk 流式输出，DeepSeek 风格
+        phase = "content"
         full_text = ""
-        prev_sent_len = 0
-        think_tag_sent = False
-        content_tag_sent = False
 
         try:
-            for new_text in streamer:
+            loop = asyncio.get_event_loop()
+            while True:
+                # 逐个读取 streamer chunk，立即推送
+                try:
+                    new_text = await loop.run_in_executor(None, next, streamer)
+                except StopIteration:
+                    break
+
                 if not new_text:
                     continue
                 full_text += new_text
-                cleaned = clean_decode(full_text)
 
-                # 解析 <think >...</think > 或 <thinking>...</thinking>
-                # Qwen 使用 <think >...</think > 标签
-                think_open = -1
-                think_close = -1
-                open_tag = ""
-                close_tag = ""
+                if phase == "content":
+                    if "<thinking>" in full_text or "<think" in full_text:
+                        phase = "thinking"
+                    else:
+                        yield {"type": "content", "content": new_text}
 
-                # 先检查 <thinking>...</thinking>（DeepSleep 格式）
-                idx1 = cleaned.find("<thinking>")
-                idx2 = cleaned.find("</thinking>")
-                if idx1 != -1:
-                    think_open = idx1
-                    open_tag = "<thinking>"
-                    if idx2 != -1:
-                        think_close = idx2
-                        close_tag = "</thinking>"
+                if phase == "thinking":
+                    if "</thinking>" in full_text or "</think" in full_text:
+                        phase = "thinking_done"
+                    yield {"type": "thinking", "content": new_text}
 
-                # 再检查 <think >...</think >（Qwen 格式，可能有空格）
-                if think_open == -1:
-                    for otag, ctag in [("<think >", "</think >"), ("<think/>", "</think/>"), ("<think/>\n", "</think/>")]:
-                        idx1 = cleaned.find(otag)
-                        if idx1 != -1:
-                            idx2 = cleaned.find(ctag, idx1 + len(otag))
-                            think_open = idx1
-                            open_tag = otag
-                            if idx2 != -1:
-                                think_close = idx2
-                                close_tag = ctag
-                            break
-
-                if think_open != -1 and think_close == -1:
-                    # 正在 thinking 中
-                    if not think_tag_sent:
-                        think_tag_sent = True
-                    thinking_content = cleaned[think_open + len(open_tag):]
-                    if len(thinking_content) > prev_sent_len:
-                        delta = thinking_content[prev_sent_len:]
-                        prev_sent_len = len(thinking_content)
-                        yield {"type": "thinking", "content": delta}
-
-                elif think_close != -1:
-                    # thinking 结束
-                    if think_tag_sent and not content_tag_sent:
-                        thinking_content = cleaned[think_open + len(open_tag):think_close]
-                        if len(thinking_content) > prev_sent_len:
-                            delta = thinking_content[prev_sent_len:]
-                            yield {"type": "thinking", "content": delta}
-                        content_tag_sent = True
-                        prev_sent_len = 0
-
-                    if content_tag_sent:
-                        content_text = cleaned[think_close + len(close_tag):]
-                        if len(content_text) > prev_sent_len:
-                            delta = content_text[prev_sent_len:]
-                            prev_sent_len = len(content_text)
-                            yield {"type": "content", "content": delta}
-
-                else:
-                    # 无 thinking 标签，直接输出
-                    if len(cleaned) > prev_sent_len:
-                        delta = cleaned[prev_sent_len:]
-                        prev_sent_len = len(cleaned)
-                        yield {"type": "content", "content": delta}
+                elif phase == "thinking_done":
+                    yield {"type": "content", "content": new_text}
 
         except Exception as e:
             yield {"type": "error", "content": f"生成失败: {e}"}

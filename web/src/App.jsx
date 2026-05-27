@@ -9,6 +9,7 @@ import SleepAssessment from './components/SleepAssessment';
 import useChatStore from './hooks/useChat';
 import useModelStore from './hooks/useModel';
 import { streamChat } from './utils/api';
+import { saveConversations } from './utils/storage';
 
 export default function App() {
   const {
@@ -31,38 +32,33 @@ export default function App() {
   const currentConv = conversations.find(c => c.id === currentConversationId) || null;
   const messages = currentConv ? currentConv.messages : [];
 
-  // Keep a ref to handleSend so the event listener always has the latest version
-  const handleSendRef = useRef(handleSend);
-  handleSendRef.current = handleSend;
-
-  // Listen for custom event from SleepAssessment
-  useEffect(() => {
-    const handler = (e) => {
-      handleSendRef.current(e.detail);
-    };
-    window.addEventListener('deepsleep-send-message', handler);
-    return () => window.removeEventListener('deepsleep-send-message', handler);
-  }, []);
-
   const handleSend = useCallback(async (text) => {
     // Ensure we have a conversation
-    let convId = currentConversationId;
+    let convId = useChatStore.getState().currentConversationId;
     if (!convId) {
-      newConversation();
+      useChatStore.getState().newConversation();
       convId = useChatStore.getState().currentConversationId;
     }
 
-    // Add user message
-    addMessage('user', text);
+    // Add user message using the confirmed convId
+    const { conversations: convs } = useChatStore.getState();
+    const convIdx = convs.findIndex(c => c.id === convId);
+    if (convIdx === -1) return;
 
-    // Prepare messages for API
-    const conv = useChatStore.getState().conversations.find(c => c.id === convId);
-    const apiMessages = conv
-      ? conv.messages.map(m => ({ role: m.role, content: m.content }))
-      : [{ role: 'user', content: text }];
+    const updated = [...convs];
+    updated[convIdx] = {
+      ...updated[convIdx],
+      messages: [
+        ...updated[convIdx].messages,
+        { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8), role: 'user', content: text, thinking: '', timestamp: Date.now() },
+      ],
+      title: updated[convIdx].messages.length === 0 ? text.slice(0, 24) + (text.length > 24 ? '...' : '') : updated[convIdx].title,
+    };
+    saveConversations(updated);
+    useChatStore.setState({ conversations: updated });
 
-    // If conversation was just created, the user message is already there
-    const finalMessages = apiMessages.length > 0 ? apiMessages : [{ role: 'user', content: text }];
+    // Prepare messages for API (from the updated conversation)
+    const apiMessages = updated[convIdx].messages.map(m => ({ role: m.role, content: m.content }));
 
     // Start streaming
     setIsGenerating(true);
@@ -80,7 +76,8 @@ export default function App() {
 
     try {
       const model = useModelStore.getState().currentModel;
-      for await (const event of streamChat(finalMessages, model, settings.thinking, {
+      for await (const event of streamChat(apiMessages, model, settings.thinking, {
+        signal: controller.signal,
         temperature: settings.temperature,
         top_p: settings.top_p,
         max_tokens: settings.max_tokens,
@@ -120,7 +117,20 @@ export default function App() {
     setStreamingThinking(false);
     setIsGenerating(false);
     setAbortController(null);
-  }, [currentConversationId, settings, addMessage, updateLastMessage, setIsGenerating, setAbortController, newConversation]);
+  }, [settings, addMessage, updateLastMessage, setIsGenerating, setAbortController, newConversation]);
+
+  // Keep a ref to handleSend so the event listener always has the latest version
+  const handleSendRef = useRef(handleSend);
+  handleSendRef.current = handleSend;
+
+  // Listen for custom event from SleepAssessment
+  useEffect(() => {
+    const handler = (e) => {
+      handleSendRef.current(e.detail);
+    };
+    window.addEventListener('deepsleep-send-message', handler);
+    return () => window.removeEventListener('deepsleep-send-message', handler);
+  }, []);
 
   return (
     <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--bg-primary)' }}>

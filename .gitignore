@@ -46,6 +46,9 @@ Thumbs.db
 # Env
 .env
 
+# Node
+node_modules/
+
 # Jupyter
 .ipynb_checkpoints/
 
