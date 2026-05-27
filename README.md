@@ -115,14 +115,7 @@ snapshot_download('shephub/deepsleep', cache_dir='./model_weights')
 
 ### 3. 使用方式
 
-#### 方式 A：Gradio 简易对话（推荐快速体验）
-
-```bash
-python app.py --model out/sft/final_model.pth
-# 浏览器打开 http://localhost:6006
-```
-
-#### 方式 B：React + FastAPI 全功能对话（4模型切换 + 流式输出）
+#### 方式 A：React + FastAPI 全功能对话（4模型切换 + 流式输出）
 
 **后端启动：**
 
@@ -152,7 +145,7 @@ npm run build
 # 构建产物在 web/dist/，启动 server.py 后会自动托管前端
 ```
 
-#### 方式 C：命令行推理
+#### 方式 B：命令行推理
 
 ```python
 import torch
