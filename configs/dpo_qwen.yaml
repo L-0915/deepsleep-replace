@@ -1,0 +1,27 @@
+# Qwen2.5-0.5B DPO Configuration
+# Usage: python trainer/train_dpo_qwen.py --config configs/dpo_qwen.yaml
+
+# ==================== Data ====================
+data:
+  data_path: data/dpo/xiaoxi_dpo.jsonl
+
+# ==================== Training ====================
+training:
+  sft_model_path: out/sft_qwen/final_model
+  save_dir: out/dpo_qwen
+  epochs: 1
+  batch_size: 4
+  learning_rate: 5.0e-7
+  dpo_beta: 0.1
+  device: cuda:0
+  dtype: bfloat16
+  num_workers: 0
+  accumulation_steps: 4
+  max_seq_len: 3072
+  grad_clip: 1.0
+  log_interval: 50
+  save_interval: 200
+  seed: 42
+
+  # Resume
+  from_resume: false

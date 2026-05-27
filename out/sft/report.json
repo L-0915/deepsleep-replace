@@ -1,0 +1,12 @@
+{
+  "total_steps": 1565,
+  "epochs": 5,
+  "total_time_hours": 0.35,
+  "final_loss": 3.622489,
+  "config": {
+    "batch_size": 32,
+    "effective_batch": 32,
+    "learning_rate": 5e-06,
+    "from_weight": "out/cpt/final/model.pth"
+  }
+}

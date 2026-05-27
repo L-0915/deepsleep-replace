@@ -1,0 +1,49 @@
+{
+  "architectures": [
+    "DeepSleepForCausalLM"
+  ],
+  "auto_map": {
+    "AutoConfig": "modeling_deepsleep.DeepSleepConfig",
+    "AutoModelForCausalLM": "modeling_deepsleep.DeepSleepForCausalLM"
+  },
+  "aux_loss_coeff": 0.1,
+  "d_model": 768,
+  "dropout": 0.0,
+  "dtype": "float32",
+  "flash_attn": true,
+  "head_dim": 96,
+  "hidden_act": "silu",
+  "inference_rope_scaling": false,
+  "initializer_range": 0.02,
+  "intermediate_size": 2048,
+  "max_position_embeddings": 2048,
+  "model_type": "deepsleep",
+  "moe_intermediate_size": 1216,
+  "moe_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "n_heads": 8,
+  "n_kv_heads": 4,
+  "n_layers": 8,
+  "num_experts": 8,
+  "num_routed_experts": 8,
+  "num_shared_experts": 0,
+  "rms_norm_eps": 1e-06,
+  "rope_scaling": null,
+  "rope_theta": 10000.0,
+  "router_aux_loss_coef": 0.0005,
+  "router_jitter_noise": 0.1,
+  "top_k": 2,
+  "transformers_version": "4.56.1",
+  "use_flash_attention": true,
+  "use_moe": true,
+  "vocab_size": 7200,
+  "z_loss_coeff": 0.01
+}

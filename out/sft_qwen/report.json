@@ -1,0 +1,13 @@
+{
+  "model": "Qwen2.5-0.5B",
+  "total_steps": 3750,
+  "epochs": 3,
+  "total_time_hours": 0.97,
+  "final_loss": 2.281341,
+  "config": {
+    "batch_size": 8,
+    "effective_batch": 32,
+    "learning_rate": 5e-06,
+    "model_path": "/root/eb-public/huggingface-models/Qwen/Qwen2.5-0.5B"
+  }
+}

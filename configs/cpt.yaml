@@ -1,0 +1,71 @@
+# DeepSleep Continued Pretraining (CPT) — Medical QA
+# Usage: bash scripts/run/run_cpt.sh
+#        or: python trainer/train_cpt.py --config configs/cpt.yaml
+
+# ==================== Model ====================
+model:
+  # Loaded from pretrained checkpoint, these are fallbacks
+  hidden_size: 768
+  num_hidden_layers: 8
+  num_experts: 8
+  num_shared_experts: 0
+  num_experts_per_tok: 2
+  vocab_size: 7200
+  max_seq_len: 2048
+
+# ==================== Data ====================
+data:
+  tokenizer_path: checkpoints/tokenizer
+  pretrained_model_path: out/pretrain/final
+  data_dir: /public/huggingface-datasets/Malikeh1375/medical-question-answering-datasets
+  max_eval_samples: 10000
+  min_text_length: 30
+  pack_sequences: true
+
+# ==================== Training ====================
+training:
+  output_dir: out/cpt
+  max_steps: 2000
+  per_device_train_batch_size: 96
+  per_device_eval_batch_size: 96
+  gradient_accumulation_steps: 4    # effective batch = 384
+  gradient_checkpointing: false
+  tf32: true
+
+  # Tokens budget:
+  #   384 * 2048 * 2000 = ~1.57B tokens
+  #   ~8x total params (199M), covers ~3 epochs of medical data
+
+  # Optimizer — lower LR than pretrain (5e-5 vs 3.75e-4)
+  optim: adamw_torch_fused
+  learning_rate: 5.0e-5
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_epsilon: 1.0e-8
+  warmup_steps: 100                # ~5% of total steps
+  lr_scheduler_type: cosine
+  max_grad_norm: 1.0
+
+  # Precision
+  bf16: true
+
+  # Eval & Save
+  eval_steps: 200
+  save_steps: 500
+  save_total_limit: 2              # Only keep 2 latest checkpoints
+  logging_steps: 50
+
+  # Resume
+  # resume_from_checkpoint: out/cpt/checkpoint-1000
+
+# ==================== Logging ====================
+logging:
+  report_to: tensorboard
+  # wandb_project: DeepSleep-CPT
+  # run_name: cpt-medical
+
+# ==================== Generation ====================
+generation:
+  prompts: "The patient presents with,Common symptoms of insomnia include,Treatment for sleep apnea typically involves,The recommended dosage for"
+  max_new_tokens: 100

@@ -1,0 +1,30 @@
+# Qwen2.5-0.5B SFT Configuration
+# Usage: python trainer/train_sft_qwen.py --config configs/sft_qwen.yaml
+# Same hyperparams as sft.yaml, only save_dir differs
+
+# ==================== Data ====================
+data:
+  data_path: data/sft/xiaoxi/xiaoxi_sft.jsonl
+  tokenizer_path: checkpoints/tokenizer
+
+# ==================== Training ====================
+training:
+  save_dir: out/sft_qwen
+  epochs: 3
+  batch_size: 8
+  learning_rate: 5.0e-6
+  device: cuda:0
+  dtype: bfloat16
+  num_workers: 0
+  accumulation_steps: 4          # effective batch = 32
+  max_seq_len: 2048
+  grad_clip: 1.0
+  log_interval: 20
+  save_interval: 200
+
+  # Resume
+  from_resume: true
+
+  # Logging
+  use_wandb: false
+  wandb_project: DeepSleep-SFT-Qwen

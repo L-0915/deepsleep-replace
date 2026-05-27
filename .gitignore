@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Model weights (large files — upload to GitHub Releases instead)
+*.bin
+*.pt
+*.safetensors
+*.gguf
+*.pth
+
+# Data (large files — keep structure, ignore content)
+data/raw/
+data/processed/
+data/tokenized/
+data/cleaned/
+data/keywords/
+data/tokenizer_corpus/
+
+# Keep tokenizer checkpoint
+!checkpoints/tokenizer/
+
+# HF cache
+.hf_cache/
+
+# Logs & monitoring
+wandb/
+runs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Gradio
+flagged/
+.gradio/
+
+# Claude / internal
+.claude/
+.superpowers/

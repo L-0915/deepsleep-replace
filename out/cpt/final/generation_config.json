@@ -1,0 +1,6 @@
+{
+  "_from_model_config": true,
+  "do_sample": true,
+  "top_k": 2,
+  "transformers_version": "4.56.1"
+}
