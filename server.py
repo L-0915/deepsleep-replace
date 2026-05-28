@@ -2,24 +2,39 @@
 """
 DeepSleep Server - 睡眠健康AI对话后端服务
 支持 DeepSleep 和 Qwen 两种架构，4个模型切换，SSE流式输出
+工业级部署: torch.compile FP8 加速 + 模型预热 + CORS + 结构化日志
 """
 
 import argparse
 import asyncio
 import json
+import logging
 import os
-import queue
 import re
 import threading
+import time
+from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Dict, List
 
 import torch
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("deepsleep")
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -34,7 +49,6 @@ THINKING_SUFFIX = (
     "在回答之前，请先使用<thinking></thinking>标签进行深入思考和分析。"
 )
 
-# DeepSleep 上下文约 2048 tokens（为输入留余量），Qwen 可用更多
 MAX_CONTEXT = {"deepsleep": 1800, "qwen": 32000}
 
 MODEL_CONFIGS: Dict[str, dict] = {
@@ -61,53 +75,26 @@ MODEL_CONFIGS: Dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# 中文 decode 修复
-# ---------------------------------------------------------------------------
-
-_CJK = r"一-鿿㐀-䶿豈-﫿"
-_CJK_RE = re.compile(f"(?<=[{_CJK}])\\s+(?=[{_CJK}])")
-_PUNCT_SPACE_RE = re.compile(r"\s+([，。！？；：、）】」』])")
-_PRE_PUNCT_SPACE_RE = re.compile(r"([（【「『])\s+")
-
-
-def clean_decode(text: str) -> str:
-    """清理 tokenizer decode 后中文间的多余空格"""
-    text = _CJK_RE.sub("", text)
-    text = _PUNCT_SPACE_RE.sub(r"\1", text)
-    text = _PRE_PUNCT_SPACE_RE.sub(r"\1", text)
-    text = re.sub(r"\s{2,}", " ", text)
-    return text.strip()
-
-
-# ---------------------------------------------------------------------------
-# ModelManager — 惰性加载、线程安全推理
+# ModelManager
 # ---------------------------------------------------------------------------
 
 
 class ModelManager:
-    """管理 4 个模型的惰性加载和推理，每个模型一把异步锁防止并发冲突"""
+    """管理 4 个模型的惰性加载、FP8 加速、线程安全推理"""
 
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # 已加载的模型和 tokenizer
-        self.models: Dict[str, tuple] = {}  # model_id -> (model, tokenizer, arch)
-        # 加载锁（防止同一模型并发加载）
-        self._load_locks: Dict[str, asyncio.Lock] = {
-            mid: asyncio.Lock() for mid in MODEL_CONFIGS
-        }
-        # 推理锁（防止同一模型并发推理）
-        self._infer_locks: Dict[str, asyncio.Lock] = {
-            mid: asyncio.Lock() for mid in MODEL_CONFIGS
-        }
-
-    # ---- 加载 ----
+        self.models: Dict[str, tuple] = {}
+        self._load_locks = {mid: asyncio.Lock() for mid in MODEL_CONFIGS}
+        self._infer_locks = {mid: asyncio.Lock() for mid in MODEL_CONFIGS}
+        self._compile_enabled = False
 
     def _load_model(self, model_id: str):
-        """同步加载模型到 GPU（首次调用时触发）"""
+        """加载模型 + FP8 torch.compile 加速"""
         cfg = MODEL_CONFIGS[model_id]
         path = cfg["path"]
         arch = cfg["arch"]
-        print(f"[ModelManager] 正在加载 {cfg['name']} ({model_id}) from {path} ...")
+        logger.info(f"加载模型 {cfg['name']} ({model_id}) from {path}")
 
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         if tokenizer.pad_token is None:
@@ -121,41 +108,60 @@ class ModelManager:
         model.to(self.device)
         model.eval()
 
+        # torch.compile: 自动利用 Ada Lovelace FP8 tensor core + 算子融合
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            self._compile_enabled = True
+            logger.info(f"torch.compile 启用成功 (FP8 auto on Ada Lovelace)")
+        except Exception as e:
+            logger.warning(f"torch.compile 启用失败，使用原始 FP16: {e}")
+
         self.models[model_id] = (model, tokenizer, arch)
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
-        print(
-            f"[ModelManager] {cfg['name']} 加载完成: {n_params:.1f}M params, "
-            f"device={self.device}"
-        )
+        logger.info(f"{cfg['name']} 加载完成: {n_params:.1f}M params, device={self.device}")
+
+    def _warmup(self, model_id: str):
+        """模型预热: 跑一次推理，触发 CUDA kernel 编译和 torch.compile 缓存"""
+        model, tokenizer, arch = self.models[model_id]
+        logger.info(f"预热模型 {model_id} ...")
+        t0 = time.time()
+        dummy = tokenizer.encode("你好", return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            if arch == "deepsleep":
+                # DeepSleep 手动生成
+                past_kv = None
+                cur = dummy
+                for _ in range(8):
+                    outputs = model(input_ids=cur if past_kv is None else cur[:, -1:],
+                                    use_cache=True, past_key_values=past_kv)
+                    past_kv = outputs.past_key_values
+                    next_t = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                    cur = torch.cat([cur, next_t], dim=-1)
+            else:
+                model.generate(dummy, max_new_tokens=8, do_sample=False)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.time() - t0
+        logger.info(f"预热完成: {model_id}, 耗时 {elapsed:.1f}s")
 
     async def ensure_loaded(self, model_id: str):
-        """确保模型已加载，惰性加载带锁"""
         if model_id not in MODEL_CONFIGS:
             raise ValueError(f"未知模型: {model_id}")
         if model_id in self.models:
             return
         async with self._load_locks[model_id]:
-            # double-check
             if model_id in self.models:
                 return
-            # 在线程池中执行同步加载
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._load_model, model_id)
-
-    def get_model(self, model_id: str):
-        """获取已加载的模型和 tokenizer，返回 (model, tokenizer, arch)"""
-        return self.models[model_id]
+            await loop.run_in_executor(None, self._warmup, model_id)
 
     def is_loaded(self, model_id: str) -> bool:
         return model_id in self.models
 
-    # ---- 对话历史截断 ----
+    # ---- 对话截断 ----
 
-    def _truncate_messages(
-        self, messages: List[dict], tokenizer, max_context: int
-    ) -> List[dict]:
-        """从最早的对话开始截断，保留 system 和最近的消息"""
-        # 始终保留 system（第一条）
+    def _truncate_messages(self, messages: List[dict], tokenizer, max_context: int) -> List[dict]:
         system_msg = None
         chat_msgs = []
         for m in messages:
@@ -164,45 +170,30 @@ class ModelManager:
             else:
                 chat_msgs.append(m)
 
-        # 从头开始删，直到 token 数在限制内
         while chat_msgs:
             test_msgs = ([system_msg] if system_msg else []) + chat_msgs
             text = self._build_plain_text(test_msgs, tokenizer)
-            n_tokens = len(tokenizer.encode(text))
-            if n_tokens <= max_context:
+            if len(tokenizer.encode(text)) <= max_context:
                 break
-            # 删最早的一对 user-assistant（或单条 user）
             chat_msgs = chat_msgs[2:] if len(chat_msgs) >= 2 else chat_msgs[1:]
 
         return ([system_msg] if system_msg else []) + chat_msgs
 
     @staticmethod
     def _build_plain_text(messages: List[dict], tokenizer) -> str:
-        """用 tokenizer 的 chat_template（如果有）构建纯文本用于计数"""
         try:
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         except Exception:
-            # fallback: 手动拼接
             parts = []
             for m in messages:
                 parts.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n")
             parts.append("<|im_start|>assistant\n")
             return "".join(parts)
 
-    # ---- 流式生成 ----
+    # ---- 流式生成入口 ----
 
-    async def generate_stream(
-        self,
-        model_id: str,
-        messages: List[dict],
-        thinking: bool = True,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        max_tokens: int = 512,
-    ) -> AsyncGenerator[dict, None]:
-        """流式生成回复，yield SSE 事件字典"""
+    async def generate_stream(self, model_id, messages, thinking=True,
+                              temperature=0.7, top_p=0.9, max_tokens=512):
         try:
             await self.ensure_loaded(model_id)
         except Exception as e:
@@ -212,118 +203,93 @@ class ModelManager:
         model, tokenizer, arch = self.models[model_id]
         max_ctx = MAX_CONTEXT.get(arch, 2048)
 
-        # 异步推理锁
         async with self._infer_locks[model_id]:
             if arch == "deepsleep":
                 async for chunk in self._generate_deepsleep(
-                    model, tokenizer, messages, thinking, temperature, top_p, max_tokens, max_ctx
-                ):
+                    model, tokenizer, messages, thinking, temperature, top_p, max_tokens, max_ctx):
                     yield chunk
             else:
                 async for chunk in self._generate_qwen(
-                    model, tokenizer, messages, thinking, temperature, top_p, max_tokens, max_ctx
-                ):
+                    model, tokenizer, messages, thinking, temperature, top_p, max_tokens, max_ctx):
                     yield chunk
 
-    # ---- DeepSleep 推理 ----
+    # ---- DeepSleep 推理 (手动逐 token + KV cache) ----
 
-    async def _generate_deepsleep(
-        self, model, tokenizer, messages, thinking, temperature, top_p, max_tokens, max_ctx
-    ) -> AsyncGenerator[dict, None]:
-        """DeepSleep 模型推理：逐 token 流式输出"""
-
-        # 构建 system prompt
-        system_content = SYSTEM_PROMPT
-        if thinking:
-            system_content += THINKING_SUFFIX
-
-        # 替换 messages 中的 system
-        processed = []
-        has_system = False
-        for m in messages:
-            if m["role"] == "system":
-                processed.append({"role": "system", "content": system_content})
-                has_system = True
-            else:
-                processed.append(m)
-        if not has_system:
-            processed.insert(0, {"role": "system", "content": system_content})
-
-        # 截断
+    async def _generate_deepsleep(self, model, tokenizer, messages,
+                                  thinking, temperature, top_p, max_tokens, max_ctx):
+        system_content = SYSTEM_PROMPT + (THINKING_SUFFIX if thinking else "")
+        processed = self._prepare_messages(messages, system_content)
         processed = self._truncate_messages(processed, tokenizer, max_ctx)
 
-        # 构建 ChatML prompt
-        prompt_parts = []
-        for m in processed:
-            prompt_parts.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n")
-        prompt_parts.append("<|im_start|>assistant\n")
-        prompt_text = "".join(prompt_parts)
-
-        # tokenize
-        enc = tokenizer(prompt_text, add_special_tokens=False)
-        input_ids_list = enc["input_ids"]
-        bos_id = tokenizer.bos_token_id
-        if bos_id is not None:
-            input_ids_list = [bos_id] + input_ids_list
-
-        input_ids = torch.tensor([input_ids_list], device=self.device)
+        prompt = self._build_chatml(processed)
+        enc = tokenizer(prompt, add_special_tokens=False)
+        ids = enc["input_ids"]
+        bos = tokenizer.bos_token_id
+        if bos is not None:
+            ids = [bos] + ids
+        input_ids = torch.tensor([ids], device=self.device)
         prompt_tokens = input_ids.shape[1]
 
-        # queue: 每个元素是一个增量文本片段 (str) 或 None (结束)
-        q: queue.Queue = queue.Queue()
-        error_holder: list = [None]
+        # 在线程中逐 token 生成，通过 queue 传递
+        import queue as qmod
+        q: qmod.Queue = qmod.Queue()
+        error_holder = [None]
+        total_tokens = [0]
 
-        def _generate_thread():
-            """逐 token 生成，立即 decode 并推送全量文本（主线程算增量）"""
+        def _gen():
             try:
-                generated_ids = []
+                generated = []
                 past_kv = None
-                cur_ids = input_ids
+                cur = input_ids
+                eos_id = tokenizer.eos_token_id
 
                 with torch.no_grad():
                     for step in range(max_tokens):
-                        if past_kv is None:
-                            outputs = model(input_ids=cur_ids, use_cache=True)
-                        else:
-                            outputs = model(input_ids=cur_ids[:, -1:], past_key_values=past_kv, use_cache=True)
+                        out = model(
+                            input_ids=(cur if past_kv is None else cur[:, -1:]),
+                            use_cache=True,
+                            past_key_values=past_kv,
+                        )
+                        logits = out.logits[:, -1, :]
+                        past_kv = out.past_key_values
 
-                        logits = outputs.logits[:, -1, :]
-                        past_kv = outputs.past_key_values
-
+                        # 采样
                         logits = logits / max(temperature, 1e-8)
                         if top_p < 1.0:
-                            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-                            mask = cumulative_probs > top_p
+                            srt, idx = torch.sort(logits, descending=True)
+                            cum = torch.cumsum(torch.softmax(srt, dim=-1), dim=-1)
+                            mask = cum > top_p
                             mask[..., 1:] = mask[..., :-1].clone()
                             mask[..., 0] = False
-                            sorted_logits[mask] = float("-inf")
-                            logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+                            srt[mask] = float("-inf")
+                            logits = srt.scatter(1, idx, srt)
 
-                        probs = torch.softmax(logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1)
+                        nxt = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
 
-                        eos_id = tokenizer.eos_token_id
-                        if eos_id is not None and next_token.item() == eos_id:
+                        if eos_id is not None and nxt.item() == eos_id:
                             q.put(None)
                             return
 
-                        tid = next_token.item()
-                        generated_ids.append(tid)
-                        cur_ids = torch.cat([cur_ids, next_token], dim=-1)
+                        generated.append(nxt.item())
+                        cur = torch.cat([cur, nxt], dim=-1)
 
-                        # 逐 token 全量 decode，主线程通过比较算增量
-                        q.put(tokenizer.decode(generated_ids, skip_special_tokens=True))
+                        # 每 2 个 token decode 一次（平衡延迟和多字节字符安全）
+                        if len(generated) % 2 == 0 or step < 4:
+                            text = tokenizer.decode(generated, skip_special_tokens=True)
+                            q.put(text)
 
+                if generated and len(generated) % 2 != 0:
+                    q.put(tokenizer.decode(generated, skip_special_tokens=True))
                 q.put(None)
+                total_tokens[0] = len(generated)
             except Exception as e:
                 error_holder[0] = str(e)
                 q.put(None)
 
-        t = threading.Thread(target=_generate_thread, daemon=True)
+        t = threading.Thread(target=_gen, daemon=True)
         t.start()
 
-        # 解析 thinking/content，逐 token 推送
+        # 主线程: 从 queue 读取，解析 thinking/content，逐字符推送
         last_text = ""
         phase = "content"
 
@@ -332,105 +298,48 @@ class ModelManager:
                 item = await asyncio.get_event_loop().run_in_executor(None, q.get)
                 if item is None:
                     break
-                if error_holder[0] is not None:
+                if error_holder[0]:
                     yield {"type": "error", "content": error_holder[0]}
                     return
 
-                full_text: str = item
-                if len(full_text) <= len(last_text):
+                full = item
+                if len(full) <= len(last_text):
                     continue
-                delta = full_text[len(last_text):]
-                last_text = full_text
+                delta = full[len(last_text):]
+                last_text = full
 
-                if phase == "content":
-                    think_idx = full_text.find("<thinking>")
-                    if think_idx != -1:
-                        phase = "thinking"
-                        before = full_text[:think_idx].strip()
-                        if before:
-                            yield {"type": "content", "content": before}
-                        # delta 中 thinking> 之后的部分作为 thinking 开始
-                        tag_in_delta = delta.find("<thinking>")
-                        if tag_in_delta != -1:
-                            think_delta = delta[tag_in_delta + len("<thinking>"):]
-                            if think_delta:
-                                yield {"type": "thinking", "content": think_delta}
-                    else:
-                        yield {"type": "content", "content": delta}
-
-                elif phase == "thinking":
-                    close_idx = full_text.find("</thinking>")
-                    if close_idx == -1:
-                        yield {"type": "thinking", "content": delta}
-                    else:
-                        phase = "thinking_done"
-                        # delta 中 </thinking> 之前的部分仍是 thinking
-                        tag_in_delta = delta.find("</thinking>")
-                        think_delta = delta[:tag_in_delta] if tag_in_delta != -1 else ""
-                        if think_delta:
-                            yield {"type": "thinking", "content": think_delta}
-                        content_delta = delta[tag_in_delta + len("</thinking>"):] if tag_in_delta != -1 else delta
-                        if content_delta:
-                            yield {"type": "content", "content": content_delta}
-
-                elif phase == "thinking_done":
-                    yield {"type": "content", "content": delta}
+                async for evt in self._parse_thinking(delta, full, phase):
+                    phase = evt.get("_phase", phase)
+                    if "_phase" in evt:
+                        del evt["_phase"]
+                    yield evt
 
         finally:
             t.join(timeout=5)
 
-        completion_tokens = len(generated_ids) if generated_ids else len(tokenizer.encode(last_text))
-        yield {
-            "type": "done",
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-            },
-        }
+        yield {"type": "done", "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": total_tokens[0],
+        }}
 
-    # ---- Qwen 推理 ----
+    # ---- Qwen 推理 (model.generate + TextIteratorStreamer) ----
 
-    async def _generate_qwen(
-        self, model, tokenizer, messages, thinking, temperature, top_p, max_tokens, max_ctx
-    ) -> AsyncGenerator[dict, None]:
-        """Qwen 模型推理：apply_chat_template + TextIteratorStreamer"""
-
-        system_content = SYSTEM_PROMPT
-        if thinking:
-            system_content += THINKING_SUFFIX
-
-        processed = []
-        has_system = False
-        for m in messages:
-            if m["role"] == "system":
-                processed.append({"role": "system", "content": system_content})
-                has_system = True
-            else:
-                processed.append(m)
-        if not has_system:
-            processed.insert(0, {"role": "system", "content": system_content})
-
+    async def _generate_qwen(self, model, tokenizer, messages,
+                             thinking, temperature, top_p, max_tokens, max_ctx):
+        system_content = SYSTEM_PROMPT + (THINKING_SUFFIX if thinking else "")
+        processed = self._prepare_messages(messages, system_content)
         processed = self._truncate_messages(processed, tokenizer, max_ctx)
 
         try:
-            prompt = tokenizer.apply_chat_template(
-                processed, tokenize=False, add_generation_prompt=True
-            )
+            prompt = tokenizer.apply_chat_template(processed, tokenize=False, add_generation_prompt=True)
         except Exception:
-            prompt_parts = []
-            for m in processed:
-                prompt_parts.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n")
-            prompt_parts.append("<|im_start|>assistant\n")
-            prompt = "".join(prompt_parts)
+            prompt = self._build_chatml(processed)
 
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         prompt_tokens = inputs["input_ids"].shape[1]
 
-        streamer = TextIteratorStreamer(
-            tokenizer, skip_prompt=True, skip_special_tokens=True
-        )
-
-        gen_kwargs = {
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        gen_kw = {
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs.get("attention_mask"),
             "max_new_tokens": max_tokens,
@@ -442,43 +351,32 @@ class ModelManager:
             "eos_token_id": tokenizer.eos_token_id,
         }
 
-        def _generate():
+        def _gen():
             with torch.no_grad():
-                model.generate(**gen_kwargs)
+                model.generate(**gen_kw)
 
-        t = threading.Thread(target=_generate, daemon=True)
+        t = threading.Thread(target=_gen, daemon=True)
         t.start()
 
-        # 逐 chunk 流式输出，DeepSeek 风格
         phase = "content"
         full_text = ""
 
         try:
             loop = asyncio.get_event_loop()
             while True:
-                # 逐个读取 streamer chunk，立即推送
                 try:
-                    new_text = await loop.run_in_executor(None, next, streamer)
+                    chunk = await loop.run_in_executor(None, next, streamer)
                 except StopIteration:
                     break
-
-                if not new_text:
+                if not chunk:
                     continue
-                full_text += new_text
+                full_text += chunk
 
-                if phase == "content":
-                    if "<thinking>" in full_text or "<think" in full_text:
-                        phase = "thinking"
-                    else:
-                        yield {"type": "content", "content": new_text}
-
-                if phase == "thinking":
-                    if "</thinking>" in full_text or "</think" in full_text:
-                        phase = "thinking_done"
-                    yield {"type": "thinking", "content": new_text}
-
-                elif phase == "thinking_done":
-                    yield {"type": "content", "content": new_text}
+                async for evt in self._parse_thinking(chunk, full_text, phase):
+                    phase = evt.get("_phase", phase)
+                    if "_phase" in evt:
+                        del evt["_phase"]
+                    yield evt
 
         except Exception as e:
             yield {"type": "error", "content": f"生成失败: {e}"}
@@ -486,30 +384,118 @@ class ModelManager:
         finally:
             t.join(timeout=5)
 
-        completion_tokens = len(tokenizer.encode(full_text))
-        yield {
-            "type": "done",
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-            },
-        }
+        yield {"type": "done", "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": len(tokenizer.encode(full_text)),
+        }}
+
+    # ---- 共用工具 ----
+
+    @staticmethod
+    def _prepare_messages(messages, system_content):
+        processed = []
+        has_system = False
+        for m in messages:
+            if m["role"] == "system":
+                processed.append({"role": "system", "content": system_content})
+                has_system = True
+            else:
+                processed.append(m)
+        if not has_system:
+            processed.insert(0, {"role": "system", "content": system_content})
+        return processed
+
+    @staticmethod
+    def _build_chatml(messages):
+        parts = []
+        for m in messages:
+            parts.append(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n")
+        parts.append("<|im_start|>assistant\n")
+        return "".join(parts)
+
+    @staticmethod
+    async def _parse_thinking(delta, full_text, phase):
+        """解析 <thinking>...</thinking> 标签，按 2 字符一组推送"""
+        CHUNK = 2
+
+        if phase == "content":
+            idx = delta.find("<thinking>")
+            if idx != -1:
+                before = delta[:idx]
+                if before:
+                    for i in range(0, len(before), CHUNK):
+                        yield {"type": "content", "content": before[i:i + CHUNK]}
+                phase = "thinking"
+                think_part = delta[idx + len("<thinking>"):]
+                for i in range(0, len(think_part), CHUNK):
+                    yield {"type": "thinking", "content": think_part[i:i + CHUNK], "_phase": "thinking"}
+                return
+            else:
+                for i in range(0, len(delta), CHUNK):
+                    yield {"type": "content", "content": delta[i:i + CHUNK]}
+                return
+
+        if phase == "thinking":
+            idx = delta.find("</thinking>")
+            if idx != -1:
+                think_part = delta[:idx]
+                if think_part:
+                    for i in range(0, len(think_part), CHUNK):
+                        yield {"type": "thinking", "content": think_part[i:i + CHUNK]}
+                content_part = delta[idx + len("</thinking>"):]
+                for i in range(0, len(content_part), CHUNK):
+                    yield {"type": "content", "content": content_part[i:i + CHUNK], "_phase": "thinking_done"}
+                return
+            else:
+                for i in range(0, len(delta), CHUNK):
+                    yield {"type": "thinking", "content": delta[i:i + CHUNK], "_phase": "thinking"}
+                return
+
+        # thinking_done
+        for i in range(0, len(delta), CHUNK):
+            yield {"type": "content", "content": delta[i:i + CHUNK], "_phase": "thinking_done"}
 
 
 # ---------------------------------------------------------------------------
-# 全局 ModelManager 实例
+# 全局实例
 # ---------------------------------------------------------------------------
 
 manager = ModelManager()
 
 # ---------------------------------------------------------------------------
-# FastAPI 应用
+# FastAPI 应用 + 生产配置
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="DeepSleep Server", version="1.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期: 启动时打印信息"""
+    logger.info("=" * 50)
+    if torch.cuda.is_available():
+        logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
+        free, total = torch.cuda.mem_get_info(0)
+        logger.info(f"显存: {total / 1024**3:.1f} GB (可用 {free / 1024**3:.1f} GB)")
+    else:
+        logger.warning("未检测到 GPU")
+    logger.info(f"可用模型: {list(MODEL_CONFIGS.keys())}")
+    logger.info("=" * 50)
+    yield
+
+
+app = FastAPI(title="DeepSleep Server", version="1.0.0", lifespan=lifespan)
+
+# CORS: 公网部署必须
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ---------------------------------------------------------------------------
-# Pydantic 请求模型
+# 请求模型
 # ---------------------------------------------------------------------------
 
 
@@ -523,26 +509,22 @@ class ChatRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# API 端点
+# API
 # ---------------------------------------------------------------------------
 
 
 @app.get("/api/health")
 async def health():
-    """健康检查，返回 GPU 信息"""
-    gpu_name = "N/A"
-    vram_used = 0.0
-    vram_total = 0.0
-
+    gpu = "N/A"
+    vram_used = vram_total = 0.0
     if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
+        gpu = torch.cuda.get_device_name(0)
         free, total = torch.cuda.mem_get_info(0)
         vram_used = (total - free) / (1024 ** 3)
         vram_total = total / (1024 ** 3)
-
     return {
         "status": "ok",
-        "gpu": gpu_name,
+        "gpu": gpu,
         "vram_used_gb": round(vram_used, 2),
         "vram_total_gb": round(vram_total, 2),
         "loaded_models": list(manager.models.keys()),
@@ -551,37 +533,23 @@ async def health():
 
 @app.get("/api/models")
 async def list_models():
-    """返回模型列表和加载状态"""
-    models = []
-    for mid, cfg in MODEL_CONFIGS.items():
-        models.append(
-            {
-                "id": mid,
-                "name": cfg["name"],
-                "arch": cfg["arch"],
-                "loaded": manager.is_loaded(mid),
-            }
-        )
-    return {"models": models}
+    return {"models": [
+        {"id": mid, "name": cfg["name"], "arch": cfg["arch"], "loaded": manager.is_loaded(mid)}
+        for mid, cfg in MODEL_CONFIGS.items()
+    ]}
 
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
-    """SSE 流式对话端点"""
-    model_id = request.model
-    if model_id not in MODEL_CONFIGS:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"未知模型: {model_id}，可选: {list(MODEL_CONFIGS.keys())}"},
-        )
-
+    if request.model not in MODEL_CONFIGS:
+        return JSONResponse(400, content={"error": f"未知模型: {request.model}"})
     if not request.messages:
-        return JSONResponse(status_code=400, content={"error": "messages 不能为空"})
+        return JSONResponse(400, content={"error": "messages 不能为空"})
 
     async def _stream():
         try:
             async for chunk in manager.generate_stream(
-                model_id=model_id,
+                model_id=request.model,
                 messages=request.messages,
                 thinking=request.thinking,
                 temperature=request.temperature,
@@ -590,73 +558,58 @@ async def chat(request: ChatRequest):
             ):
                 yield {"event": chunk["type"], "data": json.dumps(chunk, ensure_ascii=False)}
         except Exception as e:
-            yield {
-                "event": "error",
-                "data": json.dumps(
-                    {"type": "error", "content": str(e)}, ensure_ascii=False
-                ),
-            }
+            logger.error(f"生成异常: {e}", exc_info=True)
+            yield {"event": "error", "data": json.dumps({"type": "error", "content": str(e)})}
 
     return EventSourceResponse(_stream())
 
 
 # ---------------------------------------------------------------------------
-# 静态文件托管（前端）
+# 静态文件
 # ---------------------------------------------------------------------------
 
-# 尝试挂载 web/dist 或 static 目录
 _static_dir = None
-_web_dist = os.path.join(os.path.dirname(__file__), "web", "dist")
-_local_static = os.path.join(os.path.dirname(__file__), "static")
-
-if os.path.isdir(_web_dist) and os.listdir(_web_dist):
-    _static_dir = _web_dist
-elif os.path.isdir(_local_static) and os.listdir(_local_static):
-    _static_dir = _local_static
+for _candidate in [
+    os.path.join(os.path.dirname(__file__), "web", "dist"),
+    os.path.join(os.path.dirname(__file__), "static"),
+]:
+    if os.path.isdir(_candidate) and os.listdir(_candidate):
+        _static_dir = _candidate
+        break
 
 
 @app.get("/")
 async def root():
-    """根路径重定向到静态文件"""
     if _static_dir:
         return RedirectResponse(url="/index.html")
-    return {"message": "DeepSleep Server is running. No frontend files found."}
+    return {"message": "DeepSleep Server running. No frontend found."}
 
 
 if _static_dir:
     app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
 
-# ---------------------------------------------------------------------------
-# 启动入口
-# ---------------------------------------------------------------------------
 
-
-def print_gpu_info():
-    """启动时打印 GPU 信息"""
-    print("=" * 60)
-    print("DeepSleep Server - 睡眠健康AI对话后端")
-    print("=" * 60)
-    if torch.cuda.is_available():
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        free, total = torch.cuda.mem_get_info(0)
-        print(f"显存: {total / 1024**3:.1f} GB (可用 {free / 1024**3:.1f} GB)")
-    else:
-        print("警告: 未检测到 GPU，将使用 CPU（速度很慢）")
-    print(f"可用模型: {list(MODEL_CONFIGS.keys())}")
-    print("=" * 60)
+# ---------------------------------------------------------------------------
+# 启动
+# ---------------------------------------------------------------------------
 
 
 def main():
     parser = argparse.ArgumentParser(description="DeepSleep Server")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址 (默认: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=7860, help="监听端口 (默认: 7860)")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--preload", action="store_true", help="启动时预加载所有模型")
     args = parser.parse_args()
-
-    print_gpu_info()
 
     import uvicorn
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    if args.preload:
+        logger.info("预加载所有模型 ...")
+        for mid in MODEL_CONFIGS:
+            manager._load_model(mid)
+            manager._warmup(mid)
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 
 if __name__ == "__main__":

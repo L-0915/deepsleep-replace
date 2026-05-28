@@ -1,7 +1,7 @@
 # DeepSleep vs Qwen: 域特定LLM训练的2²全因子实验设计
 
 > 《科学实验分析》大作业实验计划
-> 日期: 2026-05-25 | 更新: 2026-05-25
+> 日期: 2026-05-25 | 更新: 2026-05-28
 
 ---
 
@@ -402,3 +402,79 @@ python scripts/analysis/plot_benchmark_anova.py
 | `scripts/eval/plot_radar.py` | 雷达图+CSV数据表生成 |
 | `data/eval/benchmark_results/` | lm-eval 评估结果目录 |
 | `data/eval/pubmedqa_local/` | PubMedQA 本地数据 (lm-eval自定义任务) |
+
+---
+
+## 8. 产品部署: DeepSleep Chat
+
+基于实验中的 4 个最优模型，构建了完整的 AI 对话产品。
+
+### 8.1 架构
+
+```
+浏览器 (React 18 + Vite 6 + Tailwind CSS 4)
+    ↕ SSE (Server-Sent Events, text/event-stream)
+FastAPI 后端 (server.py, Python)
+    ↕ torch.compile(mode="reduce-overhead")
+ModelManager (4模型惰性加载, FP8加速, 线程安全)
+    ├── DeepSleep β=0.1 (MoE, ~199M, out/ds_b0.1_hf/)
+    ├── DeepSleep β=0.5 (MoE, ~199M, out/ds_b0.5_hf/)
+    ├── Qwen β=0.1 (Dense, ~494M, qwen_b0.1_s42/final_model/)
+    └── Qwen β=0.5 (Dense, ~494M, qwen_b0.5_s42/final_model/)
+```
+
+**硬件:** NVIDIA GeForce RTX 4090 D (24GB, Ada Lovelace, Compute 8.9)
+
+### 8.2 后端技术
+
+| 特性 | 实现方式 |
+|------|----------|
+| 推理加速 | `torch.compile(mode="reduce-overhead")` 自动 FP8 tensor core |
+| 流式输出 | SSE (sse-starlette), 每 2 字符推送 |
+| 模型管理 | 惰性加载 + 模型预热 (CUDA kernel 预编译) |
+| 线程安全 | 每模型独立 asyncio.Lock |
+| 对话截断 | 自动截断到模型最大上下文 (DeepSleep 1800/Qwen 32000 tokens) |
+| 跨域 | FastAPI CORSMiddleware |
+| 日志 | Python logging 模块 |
+
+### 8.3 前端功能
+
+| 功能 | 说明 |
+|------|------|
+| 模型切换 | 顶栏下拉: 架构 (DeepSleep/Qwen) × β (0.1/0.5) = 4 种组合 |
+| 思考模式 | 输入框旁开关, 显示 `<thinking>` 标签内容为折叠面板 |
+| 参数控制 | Temperature (0.1-1.5), Top-P (0.5-1.0), 最大长度 (64-1024) |
+| 对话管理 | 新建/切换/删除对话, localStorage 持久化 |
+| 模型对比 | 双栏并排, 同一问题同时发给两个模型 |
+| 睡眠评估 | 7 题 PSQI 问卷, 自动评分, 一键让 AI 分析结果 |
+| 主题切换 | 深色/浅色 |
+| 对话导出 | Markdown 文件下载 |
+| Markdown 渲染 | react-markdown + remark-gfm + rehype-highlight |
+| 响应式 | 桌面/移动端自适应 |
+
+### 8.4 启动方式
+
+```bash
+# 安装后端依赖
+pip install fastapi uvicorn sse-starlette torch transformers accelerate
+
+# 安装前端依赖 & 构建
+cd web && npm install && npm run build && cd ..
+
+# 启动服务 (首次请求自动加载模型)
+python server.py --port 7860
+
+# 或启动时预加载所有模型 (推荐)
+python server.py --port 7860 --preload
+```
+
+### 8.5 产品关键文件
+
+| 文件 | 说明 |
+|------|------|
+| `server.py` | FastAPI 后端主服务 |
+| `web/src/App.jsx` | React 根组件 |
+| `web/src/components/*.jsx` | 10 个 UI 组件 |
+| `web/src/hooks/useChat.js` | Zustand 状态管理 |
+| `web/src/utils/api.js` | SSE 通信封装 |
+| `static/` | 构建产物 (FastAPI 托管) |

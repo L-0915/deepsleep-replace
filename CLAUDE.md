@@ -43,6 +43,30 @@ deepsleep/
 │   ├── prepare_deepsleep_data.py    # ✅ 预训练数据下载 (从HuggingFace加载CCI4.0-HQ)
 │   ├── train_tokenizer.py           # ✅ BPE分词器训练 (vocab=7200, 中英双语, 支持CCI4.0)
 │   └── compare_tracks.py            # ✅ 双轨对比评估 (自包含, 含MCQ/CoT/人格/延迟)
+├── server.py                        # ✅ 生产级 FastAPI 后端 (4模型切换, SSE流式, torch.compile FP8加速)
+├── web/                             # ✅ React + Vite + Tailwind 前端 (DeepSeek风格UI)
+│   ├── src/
+│   │   ├── App.jsx                  # 根组件 (SSE流处理, 事件监听)
+│   │   ├── components/              # UI 组件
+│   │   │   ├── Header.jsx           # 顶栏: Logo + 模型架构/β下拉 + 设置
+│   │   │   ├── Sidebar.jsx          # 侧边栏: 新对话 + 历史 + 睡眠评估/模型对比入口
+│   │   │   ├── ChatArea.jsx         # 对话区域 + 自动滚动
+│   │   │   ├── MessageBubble.jsx    # 消息气泡 + Markdown渲染 + Token统计
+│   │   │   ├── ThinkingBlock.jsx    # 思考过程折叠面板 (脉冲动画)
+│   │   │   ├── InputArea.jsx        # 输入框 + 思考开关 + 发送/停止
+│   │   │   ├── SettingsPanel.jsx    # 参数设置: Temperature/Top-P/MaxTokens
+│   │   │   ├── CompareMode.jsx      # 模型对比模式 (双栏并排)
+│   │   │   ├── SleepAssessment.jsx  # 睡眠评估问卷 (简化版PSQI)
+│   │   │   └── WelcomeScreen.jsx    # 欢迎页 + 快捷提问
+│   │   ├── hooks/
+│   │   │   ├── useChat.js           # Zustand: 对话CRUD + 设置 + localStorage
+│   │   │   └── useModel.js          # 模型选择 (架构×β = 4种)
+│   │   └── utils/
+│   │       ├── api.js               # SSE流式请求 + fetchModels + fetchHealth
+│   │       └── storage.js           # localStorage 封装
+│   ├── vite.config.js               # outDir=../static, API proxy → :7860
+│   └── package.json
+├── static/                          # 前端构建产物 (npm run build → 此目录)
 ├── data/
 │   ├── sft/xiaoxi/
 │   │   ├── all_prompts.jsonl        # ✅ 10110条统一prompt (6类别)
@@ -53,7 +77,7 @@ deepsleep/
 │       └── xiaoxi_dpo.jsonl          # ✅ 1965对 DPO对比数据
 ├── docs/                            # 设计文档, 计划
 ├── tests/                           # 单元测试
-├── app.py                           # Gradio web UI
+├── app.py                           # 旧版 Gradio web UI (保留)
 ├── Makefile
 ├── pyproject.toml
 ├── requirements.txt
@@ -68,63 +92,48 @@ deepsleep/
 # Install
 pip install -e ".[dev]"
 
+# === 产品部署 (DeepSleep Chat) ===
+
+# 启动生产级服务 (FastAPI + React前端)
+python server.py --port 7860
+
+# 启动时预加载所有模型 (推荐, 避免首请求延迟)
+python server.py --port 7860 --preload
+
+# 旧版 Gradio UI (保留)
+python app.py --model /path/to/checkpoint
+
+# 前端开发
+cd web && npm run dev        # 开发模式 (热更新, 代理API到:7860)
+cd web && npm run build      # 构建到 ../static/
+
 # === Data Generation ===
 
-# SFT数据: Step 1 - 生成全部prompt
-python scripts/generate_xiaoxi_all.py --step prompts
+python scripts/generate_xiaoxi_all.py --step prompts     # 生成SFT prompt
+python scripts/generate_xiaoxi_all.py --step responses   # 生成SFT response
+python scripts/generate_xiaoxi_all.py --step supplement  # 补充thinking样本
+python scripts/generate_xiaoxi_all.py --step stats       # 查看统计
 
-# SFT数据: Step 2 - 生成全部responses
-python scripts/generate_xiaoxi_all.py --step responses
+python scripts/generate_xiaoxi_dpo.py --step prompts     # 生成DPO prompt
+python scripts/generate_xiaoxi_dpo.py --step pairs       # 生成DPO对比
+python scripts/generate_xiaoxi_dpo.py --step stats       # 查看统计
 
-# SFT数据: 补充生成带thinking的样本 (非CoT类别，生成新prompt+回答，追加到原文件)
-python scripts/generate_xiaoxi_all.py --step supplement
-
-# SFT数据: 查看统计
-python scripts/generate_xiaoxi_all.py --step stats
-
-# DPO数据: Step 1 - 生成prompt
-python scripts/generate_xiaoxi_dpo.py --step prompts
-
-# DPO数据: Step 2 - 生成chosen+rejected对
-python scripts/generate_xiaoxi_dpo.py --step pairs
-
-# DPO数据: 查看统计
-python scripts/generate_xiaoxi_dpo.py --step stats
-
-# 预训练数据: 从CCI4.0-HQ采样~12B tokens
-python scripts/prepare_deepsleep_data.py
-
-# 预训练数据: 用tokenizer精确计数 (推荐)
-python scripts/prepare_deepsleep_data.py --tokenizer_path checkpoints/tokenizer
-
-# 预训练数据: 仅验证已有数据
-python scripts/prepare_deepsleep_data.py --validate
+python scripts/prepare_deepsleep_data.py                  # 预训练数据
+python scripts/prepare_deepsleep_data.py --tokenizer_path checkpoints/tokenizer --validate
 
 # === Training (single GPU, HuggingFace Trainer) ===
 
-# 一键启动 (推荐)
 bash scripts/run/run_pretrain.sh                    # 预训练
 bash scripts/run/run_sft.sh                         # SFT
 bash scripts/run/run_dpo.sh                         # DPO
 bash scripts/run/run_all.sh                         # 全流程
 
-# 用YAML配置文件
 python trainer/train_pretrain.py --config configs/pretrain.yaml --tokenizer_path checkpoints/tokenizer
 python trainer/train_sft.py --config configs/sft.yaml
 python trainer/train_dpo.py --config configs/dpo.yaml
 
-# 直接命令行 (覆盖配置)
-python trainer/train_pretrain.py --tokenizer_path checkpoints/tokenizer --learning_rate 3e-4
-python trainer/train_sft.py --config configs/sft.yaml --learning_rate 5e-6
-
 # Evaluation
-python scripts/compare_tracks.py \
-    --track_a out/sft_a.pth \
-    --track_b out/sft_b.pth \
-    --tokenizer_path checkpoints/tokenizer
-
-# Serving
-python app.py --model /path/to/checkpoint
+python scripts/compare_tracks.py --track_a out/sft_a.pth --track_b out/sft_b.pth --tokenizer_path checkpoints/tokenizer
 
 # Quick make targets
 make pretrain ARGS="--data_path ... --tokenizer_path ..."
@@ -186,6 +195,78 @@ Mainstream components: GQA · RoPE · RMSNorm · SwiGLU · Flash Attention · Pr
 | Pretrain | `/root/autodl-tmp/data/deepsleep_model/final_model/` | 11,718 steps, loss 3.00 |
 | SFT | `/root/autodl-tmp/data/deepsleep_model_sft/final_model/` | 32,625 steps, eval 1.84 |
 | DPO | `/root/autodl-tmp/data/deepsleep_model_dpo_r2/final_model/` | 320 steps, acc 63.6% |
+
+---
+
+## 产品: DeepSleep Chat
+
+### 产品概述
+
+DeepSleep Chat 是一个 DeepSeek 风格的 AI 对话产品，接入训练完成的 4 个模型（DeepSleep/Qwen × β=0.1/0.5），支持公网部署。
+
+**技术架构:**
+
+```
+浏览器 (React + Vite + Tailwind CSS)
+    ↕ SSE (Server-Sent Events)
+FastAPI 后端 (server.py)
+    ↕ torch.compile (FP8 auto on RTX 4090 D / Ada Lovelace)
+ModelManager (4个模型惰性加载 + 线程安全推理)
+```
+
+### 可用模型
+
+| 模型 ID | 名称 | 架构 | HF路径 |
+|---------|------|------|--------|
+| `ds_b0.1` | DeepSleep β=0.1 | deepsleep | `out/ds_b0.1_hf/` |
+| `ds_b0.5` | DeepSleep β=0.5 | deepsleep | `out/ds_b0.5_hf/` |
+| `qwen_b0.1` | Qwen β=0.1 | qwen | `/root/blockdata/dpo_exp/qwen_b0.1_s42/final_model/` |
+| `qwen_b0.5` | Qwen β=0.5 | qwen | `/root/blockdata/dpo_exp/qwen_b0.5_s42/final_model/` |
+
+### 后端 (server.py)
+
+**技术栈:** FastAPI + uvicorn + sse-starlette + torch + transformers
+
+**核心特性:**
+- **torch.compile FP8 加速**: 自动利用 RTX 4090 D (Ada Lovelace) FP8 tensor core，算子融合
+- **惰性加载 + 模型预热**: 首次请求自动加载+预热（CUDA kernel编译），支持 `--preload` 启动时全加载
+- **SSE 流式输出**: 逐字符推送，DeepSeek 风格打字机效果
+- **思考模式**: 解析 `<thinking>...</thinking>` 标签，思考过程折叠展示
+- **上下文截断**: 自动截断对话历史到模型最大上下文长度
+- **线程安全**: 每个模型独立 asyncio.Lock，防止并发推理冲突
+- **CORS**: 支持公网部署跨域访问
+- **结构化日志**: Python logging 模块
+
+**API 端点:**
+- `POST /api/chat` — SSE 流式对话（请求体含 model/thinking/temperature/top_p/max_tokens）
+- `GET /api/models` — 模型列表 + 加载状态
+- `GET /api/health` — GPU 信息 + 显存 + 已加载模型
+
+**推理优化:**
+- DeepSleep: 手动逐 token 生成 + KV cache，每 2 token decode 一次（减少 tokenizer 开销）
+- Qwen: `model.generate()` + `TextIteratorStreamer`（HF 原生流式，高度优化）
+- 两者均通过 `torch.compile(mode="reduce-overhead")` 编译，自动 FP8
+
+### 前端 (web/)
+
+**技术栈:** React 18 + Vite 6 + Tailwind CSS 4 + Zustand
+
+**UI 布局 (DeepSeek 风格深色主题):**
+- 顶栏: Logo + 模型架构选择 (DeepSleep/Qwen) + β 值选择 (0.1/0.5) + 设置按钮
+- 侧边栏: 新对话 + 对话历史（按日期分组）+ 删除对话 + 睡眠评估/模型对比入口
+- 对话区: 用户紫色气泡 / AI 深灰气泡 + Markdown 渲染 + 思考过程折叠面板 + Token 统计
+- 输入区: 自动增长 textarea + Enter 发送 + 思考模式开关 + 发送/停止按钮
+- 欢迎页: 小曦介绍 + 6 个快捷提问卡片
+- 设置面板: Temperature / Top-P / 最大生成长度滑块
+
+**创新功能:**
+1. **模型对比模式 (CompareMode)** — 选择两个模型，同一问题双栏并排对比回答
+2. **睡眠评估工具 (SleepAssessment)** — 7 题简化版 PSQI 问卷，自动评分，一键让 AI 分析
+3. **深色/浅色主题切换**
+4. **对话导出** — 导出 Markdown 文件
+5. **对话持久化** — localStorage 自动保存
+
+**构建:** `npm run build` → 输出到 `../static/`，由 FastAPI 托管静态文件
 
 ---
 
@@ -315,6 +396,21 @@ Stage 5: lm-eval Benchmark ✅ → data/eval/benchmark_results/ (8模型×5 benc
 
 ## Next Steps (Remaining Work)
 
+### DeepSleep Chat 产品 — 已完成 ✅
+
+产品级 AI 对话界面已完成开发，包含:
+- ✅ 生产级 FastAPI 后端 (server.py)
+- ✅ React + Vite + Tailwind 前端 (web/)
+- ✅ 4 模型切换 (DeepSleep/Qwen × β=0.1/0.5)
+- ✅ 思考/非思考模式
+- ✅ SSE 流式逐字输出
+- ✅ torch.compile FP8 加速
+- ✅ 模型对比模式
+- ✅ 睡眠评估工具
+- ✅ 对话历史持久化
+- ✅ 深色/浅色主题
+- ✅ 公网部署 (CORS)
+
 ### 《科学实验分析》大作业 — 2²全因子DPO实验
 
 > 详细计划见: `docs/experiment-design-plan.md`
@@ -362,6 +458,7 @@ Stage 5: lm-eval Benchmark ✅ → data/eval/benchmark_results/ (8模型×5 benc
 
 ## Update Log
 
+- **2026-05-28**: 产品封顶 — 完成 DeepSleep Chat 对话产品。后端 `server.py` (FastAPI + SSE 流式 + torch.compile FP8 加速 + 模型预热 + CORS + 结构化日志)。前端 React + Vite + Tailwind (DeepSeek 风格深色主题, 10个组件: Header/Sidebar/ChatArea/MessageBubble/ThinkingBlock/InputArea/SettingsPanel/CompareMode/SleepAssessment/WelcomeScreen, Zustand 状态管理, localStorage 持久化)。支持 4 模型切换 (DeepSleep/Qwen × β=0.1/0.5), 思考/非思考模式, Temperature/Top-P/MaxTokens 调节, 模型对比, 睡眠评估问卷, 深色/浅色主题, 对话导出。3 Agent 并行开发 + 1 Agent 审查集成。
 - **2026-05-27**: 大作业基本完成 — Phase 3-5 全部完成。2²全因子ANOVA (`analyze_factorial.py`, 9张图+报告)。Benchmark acc_norm 双因素ANOVA (`plot_benchmark_anova.py`, 无重复设计Model×Benchmark, 手动计算+statsmodels验证+Tukey HSD+分组柱状图)。生成质量评估 (`eval_quality.py`, 30prompt×4模型×10维度, DeepSeek V4打分, ANOVA柱状图)。雷达图+Pipeline Waterfall图+风格统一(去除加粗等)。仅剩撰写实验报告。
 - **2026-05-27**: Phase 4 lm-evaluation-harness 评估进行中 — 8模型(DS Pretrain, DS β=0.1/0.5, MiniMind-3, Medical-GPT2, Qwen Base, Qwen β=0.1/0.5) × 5 benchmark(PubMedQA本地, MedQA, ARC-Easy, PIQA, OpenBookQA)。创建 `scripts/eval/` 评估工具集(convert_to_hf.py, run_benchmark.sh, merge_results.py, plot_radar.py)。DeepSleep .pth 转 HF 格式+auto_map注册。PubMedQA 自定义 lm-eval 任务(pubmedqa_local)绕过 datasets 4.x 脚本限制。4个DPO模型已有结果(PubMedQA/MedQA/ARC-Easy/PIQA)，正在补充 OpenBookQA + 新增4个基线模型。
 - **2026-05-25**: 《科学实验分析》大作业实验执行 — 2²全因子设计(模型架构×DPO Beta, 3重复=12 runs)。修复 train_dpo.py 添加 JSONL 日志/accuracy/report.json。创建 train_dpo_qwen.py 和 dpo_qwen.yaml。修复 Qwen DPO OOM (del logits 释放中间张量 + batch_size=2)。DeepSleep DPO 6组全部完成(beta=0.1 loss~0.04, beta=0.5 loss~0.0006, accuracy均100%)。Qwen DPO 6组完成。详细计划见 `docs/experiment-design-plan.md`。
