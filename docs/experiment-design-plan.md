@@ -1,7 +1,7 @@
-# DeepSleep vs Qwen: 域特定LLM训练的2²全因子实验设计
+# DeepSleep vs Qwen: 域特定LLM训练的2³全因子实验设计
 
 > 《科学实验分析》大作业实验计划
-> 日期: 2026-05-25 | 更新: 2026-05-28
+> 日期: 2026-05-25 | 更新: 2026-06-03
 
 ---
 
@@ -11,14 +11,15 @@
 
 大语言模型 (LLM) 在通用领域取得了巨大成功，但在垂直领域（如医疗健康）的应用仍面临挑战。域特定LLM需要在有限的领域数据上实现高质量的专业知识生成，同时保持模型的可控性和安全性。
 
-本实验以**睡眠健康**为垂直领域，研究两个核心问题：
+本实验以**睡眠健康**为垂直领域，研究三个核心问题：
 
 1. **模型架构的影响**：稀疏混合专家 (MoE) 与稠密 (Dense) 架构在域特定对齐任务上的差异
 2. **对齐强度的影响**：DPO (Direct Preference Optimization) 中 Beta 参数对偏好对齐效果的影响
+3. **学习率的影响**：DPO训练中学习率 (Learning Rate) 对不同架构模型收敛行为的影响
 
 ### 1.2 实验目的
 
-通过系统的 2² 全因子实验设计，研究模型架构和DPO对齐强度两个因素及其交互作用对模型对齐效果的影响，找出最优的模型-超参数组合。
+通过系统的 2³ 全因子实验设计，研究模型架构、DPO对齐强度和学习率三个因素及其交互作用对模型对齐效果的影响，找出最优的模型-超参数组合，并揭示架构特异性的超参数调优规律。
 
 ### 1.3 实验响应（评价指标）
 
@@ -34,12 +35,13 @@
 
 ### 2.1 实验设计方法
 
-采用 **2² 全因子设计 (Full Factorial Design)**，2个因素各2个水平，共4种处理组合。
+采用 **2³ 全因子设计 (Full Factorial Design)**，3个因素各2个水平，共8种处理组合。
 
 选择全因子设计的原因：
-- 可以估计所有主效应和交互效应
-- 实验量小（4组处理），适合有限GPU资源
+- 可以估计所有主效应、二阶交互效应和三阶交互效应
+- 实验量适中（8组处理 × 3重复 = 24次），适合有限GPU资源
 - ANOVA分析方法成熟，结论可靠
+- 误差自由度 = 16，F检验功效充足
 
 ### 2.2 实验因素与水平
 
@@ -47,45 +49,72 @@
 |------|------|------------|------------|
 | **A** | 模型架构 | DeepSleep MoE (199M, 64.5M active) | Qwen2.5-0.5B Dense (494M) |
 | **B** | DPO Beta | 0.1 (弱对齐) | 0.5 (强对齐) |
+| **C** | 学习率 | 5e-7 (保守) | 1e-6 (激进) |
 
 **因素选择理由：**
 - **因素A (模型架构)**: MoE通过稀疏激活实现参数效率，Dense是主流架构。对比两者在域特定场景下的对齐能力是有价值的研究问题。
 - **因素B (DPO Beta)**: Beta控制偏好对齐的强度。Beta=0.1是常用默认值（温和对齐），Beta=0.5是更强的对齐信号，可能导致过度对齐或提升效果。
+- **因素C (学习率)**: 学习率是深度学习最基础的超参数。MoE的稀疏梯度（每个token仅激活top-k个专家）可能导致与Dense模型不同的最优学习率。5e-7是DPO常用保守值，1e-6（2倍）用于探索更激进的收敛。
 
 ### 2.3 实验矩阵
 
-| Group | 模型架构 | DPO Beta | 编码 |
-|-------|---------|----------|------|
-| 1 | DeepSleep MoE | 0.1 | (-1, -1) |
-| 2 | DeepSleep MoE | 0.5 | (-1, +1) |
-| 3 | Qwen Dense | 0.1 | (+1, -1) |
-| 4 | Qwen Dense | 0.5 | (+1, +1) |
+| Group | 模型架构 | DPO Beta | 学习率 | 编码 |
+|-------|---------|----------|--------|------|
+| 1 | DeepSleep MoE | 0.1 | 5e-7 | (-1, -1, -1) |
+| 2 | DeepSleep MoE | 0.1 | 1e-6 | (-1, -1, +1) |
+| 3 | DeepSleep MoE | 0.5 | 5e-7 | (-1, +1, -1) |
+| 4 | DeepSleep MoE | 0.5 | 1e-6 | (-1, +1, +1) |
+| 5 | Qwen Dense | 0.1 | 5e-7 | (+1, -1, -1) |
+| 6 | Qwen Dense | 0.1 | 1e-6 | (+1, -1, +1) |
+| 7 | Qwen Dense | 0.5 | 5e-7 | (+1, +1, -1) |
+| 8 | Qwen Dense | 0.5 | 1e-6 | (+1, +1, +1) |
 
 ### 2.4 重复实验
 
-每组处理重复 **n=3** 次（随机种子：42, 123, 7），共 **12** 次实验。
+每组处理重复 **n=3** 次（随机种子：42, 123, 7），共 **24** 次实验。
 
 重复的目的：
 - 估计实验误差（纯误差）
-- 增加统计检验的功效（误差自由度=8）
+- 增加统计检验的功效（误差自由度=16）
 - 使 ANOVA 的 F 检验更可靠
 
 ### 2.5 完整实验计划表
 
-| Run | 模型 | Beta | Seed | SFT起点 | DPO输出目录 | 启动脚本 |
-|-----|------|------|------|---------|-------------|----------|
-| 1 | DeepSleep | 0.1 | 42 | out/sft/final_model.pth | /root/blockdata/dpo_exp/ds_b0.1_s42 | scripts/run/exp/ds_b0.1_s42.sh |
-| 2 | DeepSleep | 0.1 | 123 | out/sft/final_model.pth | /root/blockdata/dpo_exp/ds_b0.1_s123 | scripts/run/exp/ds_b0.1_s123.sh |
-| 3 | DeepSleep | 0.1 | 7 | out/sft/final_model.pth | /root/blockdata/dpo_exp/ds_b0.1_s7 | scripts/run/exp/ds_b0.1_s7.sh |
-| 4 | DeepSleep | 0.5 | 42 | out/sft/final_model.pth | /root/blockdata/dpo_exp/ds_b0.5_s42 | scripts/run/exp/ds_b0.5_s42.sh |
-| 5 | DeepSleep | 0.5 | 123 | out/sft/final_model.pth | /root/blockdata/dpo_exp/ds_b0.5_s123 | scripts/run/exp/ds_b0.5_s123.sh |
-| 6 | DeepSleep | 0.5 | 7 | out/sft/final_model.pth | /root/blockdata/dpo_exp/ds_b0.5_s7 | scripts/run/exp/ds_b0.5_s7.sh |
-| 7 | Qwen | 0.1 | 42 | out/sft_qwen/final_model | /root/blockdata/dpo_exp/qwen_b0.1_s42 | scripts/run/exp/qwen_b0.1_s42.sh |
-| 8 | Qwen | 0.1 | 123 | out/sft_qwen/final_model | /root/blockdata/dpo_exp/qwen_b0.1_s123 | scripts/run/exp/qwen_b0.1_s123.sh |
-| 9 | Qwen | 0.1 | 7 | out/sft_qwen/final_model | /root/blockdata/dpo_exp/qwen_b0.1_s7 | scripts/run/exp/qwen_b0.1_s7.sh |
-| 10 | Qwen | 0.5 | 42 | out/sft_qwen/final_model | /root/blockdata/dpo_exp/qwen_b0.5_s42 | scripts/run/exp/qwen_b0.5_s42.sh |
-| 11 | Qwen | 0.5 | 123 | out/sft_qwen/final_model | /root/blockdata/dpo_exp/qwen_b0.5_s123 | scripts/run/exp/qwen_b0.5_s123.sh |
-| 12 | Qwen | 0.5 | 7 | out/sft_qwen/final_model | /root/blockdata/dpo_exp/qwen_b0.5_s7 | scripts/run/exp/qwen_b0.5_s7.sh |
+#### LR = 5e-7 组 (C = -1, 已完成 ✅)
+
+| Run | 模型 | Beta | Seed | DPO输出目录 | 启动脚本 | 状态 |
+|-----|------|------|------|-------------|----------|------|
+| 1 | DeepSleep | 0.1 | 42 | ds_b0.1_s42 | ds_b0.1_s42.sh | ✅ |
+| 2 | DeepSleep | 0.1 | 123 | ds_b0.1_s123 | ds_b0.1_s123.sh | ✅ |
+| 3 | DeepSleep | 0.1 | 7 | ds_b0.1_s7 | ds_b0.1_s7.sh | ✅ |
+| 4 | DeepSleep | 0.5 | 42 | ds_b0.5_s42 | ds_b0.5_s42.sh | ✅ |
+| 5 | DeepSleep | 0.5 | 123 | ds_b0.5_s123 | ds_b0.5_s123.sh | ✅ |
+| 6 | DeepSleep | 0.5 | 7 | ds_b0.5_s7 | ds_b0.5_s7.sh | ✅ |
+| 7 | Qwen | 0.1 | 42 | qwen_b0.1_s42 | qwen_b0.1_s42.sh | ✅ |
+| 8 | Qwen | 0.1 | 123 | qwen_b0.1_s123 | qwen_b0.1_s123.sh | ✅ |
+| 9 | Qwen | 0.1 | 7 | qwen_b0.1_s7 | qwen_b0.1_s7.sh | ✅ |
+| 10 | Qwen | 0.5 | 42 | qwen_b0.5_s42 | qwen_b0.5_s42.sh | ✅ |
+| 11 | Qwen | 0.5 | 123 | qwen_b0.5_s123 | qwen_b0.5_s123.sh | ✅ |
+| 12 | Qwen | 0.5 | 7 | qwen_b0.5_s7 | qwen_b0.5_s7.sh | ✅ |
+
+#### LR = 1e-6 组 (C = +1, 新增 🆕)
+
+| Run | 模型 | Beta | Seed | DPO输出目录 | 启动脚本 | 状态 |
+|-----|------|------|------|-------------|----------|------|
+| 13 | DeepSleep | 0.1 | 42 | ds_b0.1_lr1e-6_s42 | ds_b0.1_lr1e-6_s42.sh | 🆕 |
+| 14 | DeepSleep | 0.1 | 123 | ds_b0.1_lr1e-6_s123 | ds_b0.1_lr1e-6_s123.sh | 🆕 |
+| 15 | DeepSleep | 0.1 | 7 | ds_b0.1_lr1e-6_s7 | ds_b0.1_lr1e-6_s7.sh | 🆕 |
+| 16 | DeepSleep | 0.5 | 42 | ds_b0.5_lr1e-6_s42 | ds_b0.5_lr1e-6_s42.sh | 🆕 |
+| 17 | DeepSleep | 0.5 | 123 | ds_b0.5_lr1e-6_s123 | ds_b0.5_lr1e-6_s123.sh | 🆕 |
+| 18 | DeepSleep | 0.5 | 7 | ds_b0.5_lr1e-6_s7 | ds_b0.5_lr1e-6_s7.sh | 🆕 |
+| 19 | Qwen | 0.1 | 42 | qwen_b0.1_lr1e-6_s42 | qwen_b0.1_lr1e-6_s42.sh | 🆕 |
+| 20 | Qwen | 0.1 | 123 | qwen_b0.1_lr1e-6_s123 | qwen_b0.1_lr1e-6_s123.sh | 🆕 |
+| 21 | Qwen | 0.1 | 7 | qwen_b0.1_lr1e-6_s7 | qwen_b0.1_lr1e-6_s7.sh | 🆕 |
+| 22 | Qwen | 0.5 | 42 | qwen_b0.5_lr1e-6_s42 | qwen_b0.5_lr1e-6_s42.sh | 🆕 |
+| 23 | Qwen | 0.5 | 123 | qwen_b0.5_lr1e-6_s123 | qwen_b0.5_lr1e-6_s123.sh | 🆕 |
+| 24 | Qwen | 0.5 | 7 | qwen_b0.5_lr1e-6_s7 | qwen_b0.5_lr1e-6_s7.sh | 🆕 |
+
+> 所有输出目录位于 `/root/blockdata/dpo_exp/`，启动脚本位于 `scripts/run/exp/`
 
 ### 2.6 控制变量（固定不变）
 
@@ -95,9 +124,10 @@
 | DPO epochs | 1 | 1 | DPO标准做法 |
 | batch_size | 4 | 2 | Qwen显存限制 |
 | accumulation | 4 | 8 | 有效batch均为16 |
-| LR | 5e-7 | 5e-7 | 一致 |
 | max_seq_len | 3072 | 3072 | 一致 |
 | 数据shuffle种子 | 按Run | 按Run | 保证重复性 |
+
+> **注意**: 学习率 (LR) 原为控制变量 (固定5e-7)，现已升级为 Factor C，水平为 5e-7 / 1e-6。
 
 ### 2.7 已完成的 DeepSleep DPO 结果
 
@@ -149,18 +179,22 @@
 
 #### (1) ANOVA 方差分析
 
-对每个响应变量 (Y₁, Y₂, Y₃) 分别进行 2² 全因子 ANOVA：
+对每个响应变量 (Y₁, Y₂, Y₃) 分别进行 2³ 全因子 ANOVA：
 
 **线性统计模型：**
 ```
-Y = μ + α·A + β·B + (αβ)·A×B + ε
+Y = μ + α·A + β·B + γ·C + (αβ)·A×B + (αγ)·A×C + (βγ)·B×C + (αβγ)·A×B×C + ε
 ```
 
 其中：
 - μ: 总均值
 - α: 因素A (模型架构) 的主效应
 - β: 因素B (DPO Beta) 的主效应
+- γ: 因素C (学习率) 的主效应
 - (αβ): A×B 交互效应
+- (αγ): A×C 交互效应
+- (βγ): B×C 交互效应
+- (αβγ): A×B×C 三阶交互效应
 - ε: 随机误差
 
 **ANOVA 表结构：**
@@ -169,11 +203,23 @@ Y = μ + α·A + β·B + (αβ)·A×B + ε
 |------|----------|----------|---------|-----|-----|
 | A (模型架构) | 1 | SS_A | MS_A | F_A | p_A |
 | B (DPO Beta) | 1 | SS_B | MS_B | F_B | p_B |
-| A×B (交互) | 1 | SS_AB | MS_AB | F_AB | p_AB |
-| 误差 | 8 | SS_E | MS_E | | |
-| 总计 | 11 | SS_T | | | |
+| C (学习率) | 1 | SS_C | MS_C | F_C | p_C |
+| A×B | 1 | SS_AB | MS_AB | F_AB | p_AB |
+| A×C | 1 | SS_AC | MS_AC | F_AC | p_AC |
+| B×C | 1 | SS_BC | MS_BC | F_BC | p_BC |
+| A×B×C | 1 | SS_ABC | MS_ABC | F_ABC | p_ABC |
+| 误差 | 16 | SS_E | MS_E | | |
+| 总计 | 23 | SS_T | | | |
 
 显著性水平 α = 0.05。
+
+**SS 计算（正交对比法）：**
+
+对 2^k 全因子设计，各效应的平方和通过正交对比计算：
+```
+SS_effect = (Σ c_i × y_i)² / N
+```
+其中 c_i 为对比系数（如 A×C 的对比系数 = A_i × C_i），N = 24 为总观测数。
 
 #### (2) 主效应分析
 
@@ -182,10 +228,11 @@ Y = μ + α·A + β·B + (αβ)·A×B + ε
 #### (3) 交互效应分析
 
 绘制交互效应图 (Interaction Plot):
-- 横轴: 因素B的水平 (Beta)
-- 纵轴: 响应变量的均值
-- 两条线: 分别代表 DeepSleep 和 Qwen
+- A×B 交互: 横轴Beta，两条线代表DeepSleep/Qwen
+- A×C 交互: 横轴LR，两条线代表DeepSleep/Qwen
+- B×C 交互: 横轴LR，两条线代表Beta=0.1/Beta=0.5
 - 若两线不平行 → 存在交互效应
+- 三阶交互: 在C的两个水平下分别绘制A×B交互图，若A×B的模式随C变化 → 存在三阶交互
 
 #### (4) 残差诊断
 
@@ -267,11 +314,12 @@ python scripts/analysis/plot_benchmark_anova.py
 
 ### 4.1 预期分析内容
 
-1. **主效应结论**: 模型架构和DPO Beta哪个因素对对齐效果影响更大？
-2. **交互效应**: 最优Beta值是否取决于模型架构？
-3. **最优组合**: 哪种模型+Beta组合的对齐效果最好？
-4. **与前人比较**: 与 DPO 论文 (Rafailov et al., 2023) 和 MoE 相关工作对比
-5. **进一步实验建议**: 若交互效应显著，是否需要响应曲面设计找最优点？
+1. **主效应结论**: 模型架构、DPO Beta和学习率哪个因素对对齐效果影响更大？
+2. **二阶交互效应**: 最优Beta值是否取决于模型架构？(A×B) 最优学习率是否取决于架构？(A×C) Beta和LR是否存在联合效应？(B×C)
+3. **三阶交互效应**: 最优的(Beta, LR)组合是否因架构而异？(A×B×C)
+4. **最优组合**: 8种处理中哪种模型+Beta+LR组合的对齐效果最好？
+5. **与前人比较**: 与 DPO 论文 (Rafailov et al., 2023) 和 MoE 相关工作对比
+6. **进一步实验建议**: 若交互效应显著，是否需要响应曲面设计找最优点？
 
 ### 4.2 论文/报告结构
 
@@ -318,22 +366,29 @@ python scripts/analysis/plot_benchmark_anova.py
 4. ✅ **Qwen SFT 完成**: `out/sft_qwen/final_model` 已就绪
 5. ✅ **修复 Qwen DPO OOM**: 添加 `del logits` 释放中间张量，batch_size 改为 2
 
-### ~~Phase 2: 执行实验~~ ✅ 已完成
+### ~~Phase 2a: 执行实验 (LR=5e-7 组)~~ ✅ 已完成
 
 6. ✅ **DeepSleep DPO 6组**: 全部完成，结果见 2.7 节
 7. ✅ **Qwen DPO 6组**: 全部完成
 8. ✅ **收集全部12组 report.json**
 
-### ~~Phase 3: 统计分析~~ ✅ 已完成
+### Phase 2b: 执行实验 (LR=1e-6 组) 🆕 新增
 
-9. ✅ **2²全因子 ANOVA 脚本**: `scripts/analysis/analyze_factorial.py`
-   - 读取12组 `/root/blockdata/dpo_exp/*/report.json`
-   - 计算 ANOVA 表（因素A, B, A×B, 误差）
-   - 生成主效应图 (Main Effects Plot)
-   - 生成交互效应图 (Interaction Plot)
-   - 残差诊断（正态概率图、残差vs拟合值图）
-   - 输出 F 值、p 值、显著性判断
-   - 生成 Fig 0-8 共 9 张图 + Markdown 分析报告
+9. ⬜ **DeepSleep DPO 高LR 6组**: Run 13-18, `scripts/run/exp/ds_b*_lr1e-6_s*.sh`
+10. ⬜ **Qwen DPO 高LR 6组**: Run 19-24, `scripts/run/exp/qwen_b*_lr1e-6_s*.sh`
+11. ⬜ **收集新增12组 report.json**
+
+### ~~Phase 3: 统计分析~~ ✅ 已完成 (升级为2³)
+
+12. ✅ **2³全因子 ANOVA 脚本**: `scripts/analysis/analyze_factorial.py`
+    - 读取24组 `/root/blockdata/dpo_exp/*/report.json`
+    - 计算 ANOVA 表（因素A, B, C, A×B, A×C, B×C, A×B×C, 误差）
+    - 生成主效应图 (3个因素)
+    - 生成二阶交互效应图 (A×B, A×C, B×C)
+    - 生成三阶交互效应图 (条件A×B at C=-1/+1)
+    - 残差诊断（正态概率图、残差vs拟合值图）
+    - Pareto 图 (7个效应排序)
+    - 生成 Fig 0-8 共 9 张图 + Markdown 分析报告
 
 10. ✅ **Benchmark acc_norm 多因素方差分析**: `scripts/analysis/plot_benchmark_anova.py`
     - 无重复双因素 ANOVA: Model(8) × Benchmark(5)
@@ -374,11 +429,12 @@ python scripts/analysis/plot_benchmark_anova.py
 | 阶段 | 内容 | 状态 | 预计时间 |
 |------|------|------|----------|
 | Phase 1 | 脚本修复+创建 | ✅ 完成 | — |
-| Phase 2 | 12组DPO实验 | ✅ 完成 | ~3h GPU |
-| Phase 3 | ANOVA统计分析 | ✅ 完成 | 3-4h |
+| Phase 2a | 12组DPO实验 (LR=5e-7) | ✅ 完成 | ~3h GPU |
+| Phase 2b | 12组DPO实验 (LR=1e-6) | 🆕 新增 | ~2h GPU |
+| Phase 3 | 2³ ANOVA统计分析 | ✅ 完成(脚本就绪) | — |
 | Phase 4 | lm-eval评估 (8模型×5 benchmark) | ✅ 完成 | 3-4h |
 | Phase 5 | 撰写报告 | 🔄 进行中 | 4-6h |
-| **总计** | | | **~12h** |
+| **总计** | | | **~14h** |
 
 > 作业截止日期: **6月28日**（第18周周日），目标6月5日前完成初稿。
 
@@ -390,11 +446,11 @@ python scripts/analysis/plot_benchmark_anova.py
 |------|------|
 | `trainer/train_dpo.py` | DeepSleep DPO 训练（含JSONL日志+accuracy+report） |
 | `trainer/train_dpo_qwen.py` | Qwen DPO 训练（含内存优化del logits） |
-| `scripts/run/exp/*.sh` | 12个独立实验启动脚本 |
+| `scripts/run/exp/*.sh` | 24个独立实验启动脚本 (12原有 + 12新增高LR) |
 | `configs/dpo.yaml` | DeepSleep DPO 配置 |
 | `configs/dpo_qwen.yaml` | Qwen DPO 配置 |
 | `dataset/lm_dataset.py` | DPODataset 数据集类 |
-| `/root/blockdata/dpo_exp/*/report.json` | 12组实验结果 |
+| `/root/blockdata/dpo_exp/*/report.json` | 24组实验结果 (12原有LR=5e-7 + 12新增LR=1e-6) |
 | `/root/dslm/lm-evaluation-harness/` | lm-eval 评估框架 |
 | `scripts/eval/convert_to_hf.py` | DeepSleep .pth → HF格式转换 |
 | `scripts/eval/run_benchmark.sh` | lm-eval 8模型×5 benchmark 评估脚本 |

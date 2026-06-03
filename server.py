@@ -49,7 +49,19 @@ THINKING_SUFFIX = (
     "在回答之前，请先使用<thinking></thinking>标签进行深入思考和分析。"
 )
 
-MAX_CONTEXT = {"deepsleep": 1800, "qwen": 32000}
+# 兼容 DeepSleep <thinking> 和 Qwen <think > 标签
+THINK_OPEN_RE = re.compile(r'<(?:thinking|think)\s*>')
+THINK_CLOSE_RE = re.compile(r'</(?:thinking|think)\s*>')
+
+# Strip special tokens from decoded text, but keep <thinking> and </thinking>
+_NON_THINKING_SPECIAL = re.compile(
+    r'<\|im_start\|>|<\|im_end\|>|<s>|</s>|<pad>|<unk>|<summary>'
+)
+
+def _strip_non_thinking_special(text):
+    return _NON_THINKING_SPECIAL.sub('', text)
+
+MAX_CONTEXT = {"deepsleep": 1800, "qwen": 32000, "qwen_mt": 32000}
 
 MODEL_CONFIGS: Dict[str, dict] = {
     "ds_b0.1": {
@@ -71,6 +83,16 @@ MODEL_CONFIGS: Dict[str, dict] = {
         "path": "/root/blockdata/dpo_exp/qwen_b0.5_s42/final_model/",
         "arch": "qwen",
         "name": "Qwen β=0.5",
+    },
+    "qwen_mt_b0.1": {
+        "path": "out/sft_qwen_multiturn_b0.1/final_model/",
+        "arch": "qwen",
+        "name": "Qwen多轮 β=0.1",
+    },
+    "qwen_mt_b0.5": {
+        "path": "out/sft_qwen_multiturn_b0.5/final_model/",
+        "arch": "qwen",
+        "name": "Qwen多轮 β=0.5",
     },
 }
 
@@ -108,13 +130,14 @@ class ModelManager:
         model.to(self.device)
         model.eval()
 
-        # torch.compile: 自动利用 Ada Lovelace FP8 tensor core + 算子融合
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            self._compile_enabled = True
-            logger.info(f"torch.compile 启用成功 (FP8 auto on Ada Lovelace)")
-        except Exception as e:
-            logger.warning(f"torch.compile 启用失败，使用原始 FP16: {e}")
+        # torch.compile 可选: --compile 参数启用
+        # 注意: 自定义 MoE 模型首次编译耗时较长 (数分钟)
+        if self._compile_enabled:
+            try:
+                model = torch.compile(model, mode="default")
+                logger.info(f"torch.compile 启用成功 (mode=default)")
+            except Exception as e:
+                logger.warning(f"torch.compile 启用失败，使用原始 FP16: {e}")
 
         self.models[model_id] = (model, tokenizer, arch)
         n_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -242,6 +265,11 @@ class ModelManager:
                 past_kv = None
                 cur = input_ids
                 eos_id = tokenizer.eos_token_id
+                # Also stop at <|im_end|> (ChatML end-of-turn marker)
+                im_end_id = tokenizer.convert_tokens_to_ids('<|im_end|>')
+                stop_ids = {eos_id} if eos_id is not None else set()
+                if isinstance(im_end_id, int) and im_end_id != tokenizer.unk_token_id:
+                    stop_ids.add(im_end_id)
 
                 with torch.no_grad():
                     for step in range(max_tokens):
@@ -252,6 +280,12 @@ class ModelManager:
                         )
                         logits = out.logits[:, -1, :]
                         past_kv = out.past_key_values
+
+                        # Repetition penalty: penalize previously generated tokens
+                        if generated:
+                            rep_penalty = 1.3
+                            for tid in set(generated[-64:]):
+                                logits[0, tid] /= rep_penalty
 
                         # 采样
                         logits = logits / max(temperature, 1e-8)
@@ -266,7 +300,7 @@ class ModelManager:
 
                         nxt = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
 
-                        if eos_id is not None and nxt.item() == eos_id:
+                        if stop_ids and nxt.item() in stop_ids:
                             q.put(None)
                             return
 
@@ -275,11 +309,14 @@ class ModelManager:
 
                         # 每 2 个 token decode 一次（平衡延迟和多字节字符安全）
                         if len(generated) % 2 == 0 or step < 4:
-                            text = tokenizer.decode(generated, skip_special_tokens=True)
+                            text = tokenizer.decode(generated, skip_special_tokens=False)
+                            text = _strip_non_thinking_special(text)
                             q.put(text)
 
                 if generated and len(generated) % 2 != 0:
-                    q.put(tokenizer.decode(generated, skip_special_tokens=True))
+                    text = tokenizer.decode(generated, skip_special_tokens=False)
+                    text = _strip_non_thinking_special(text)
+                    q.put(text)
                 q.put(None)
                 total_tokens[0] = len(generated)
             except Exception as e:
@@ -292,6 +329,7 @@ class ModelManager:
         # 主线程: 从 queue 读取，解析 thinking/content，逐字符推送
         last_text = ""
         phase = "content"
+        sent_offset = 0
 
         try:
             while True:
@@ -305,11 +343,10 @@ class ModelManager:
                 full = item
                 if len(full) <= len(last_text):
                     continue
-                delta = full[len(last_text):]
                 last_text = full
 
-                async for evt in self._parse_thinking(delta, full, phase):
-                    phase = evt.get("_phase", phase)
+                events, sent_offset, phase = self._process_thinking(full, sent_offset, phase)
+                for evt in events:
                     if "_phase" in evt:
                         del evt["_phase"]
                     yield evt
@@ -317,10 +354,17 @@ class ModelManager:
         finally:
             t.join(timeout=5)
 
+        # Flush remaining buffered text (no safety margin needed at end)
+        flush_evts, phase = self._flush_thinking(last_text, sent_offset, phase)
+        for evt in flush_evts:
+            if "_phase" in evt:
+                del evt["_phase"]
+            yield evt
+
         yield {"type": "done", "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": total_tokens[0],
-        }}
+        }, "max_context": max_ctx}
 
     # ---- Qwen 推理 (model.generate + TextIteratorStreamer) ----
 
@@ -355,25 +399,31 @@ class ModelManager:
             with torch.no_grad():
                 model.generate(**gen_kw)
 
+        def _safe_next(s):
+            try:
+                return next(s)
+            except StopIteration:
+                return None
+
         t = threading.Thread(target=_gen, daemon=True)
         t.start()
 
         phase = "content"
         full_text = ""
+        sent_offset = 0
 
         try:
             loop = asyncio.get_event_loop()
             while True:
-                try:
-                    chunk = await loop.run_in_executor(None, next, streamer)
-                except StopIteration:
+                chunk = await loop.run_in_executor(None, _safe_next, streamer)
+                if chunk is None:
                     break
                 if not chunk:
                     continue
                 full_text += chunk
 
-                async for evt in self._parse_thinking(chunk, full_text, phase):
-                    phase = evt.get("_phase", phase)
+                events, sent_offset, phase = self._process_thinking(full_text, sent_offset, phase)
+                for evt in events:
                     if "_phase" in evt:
                         del evt["_phase"]
                     yield evt
@@ -384,10 +434,17 @@ class ModelManager:
         finally:
             t.join(timeout=5)
 
+        # Flush remaining buffered text
+        flush_evts, phase = self._flush_thinking(full_text, sent_offset, phase)
+        for evt in flush_evts:
+            if "_phase" in evt:
+                del evt["_phase"]
+            yield evt
+
         yield {"type": "done", "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": len(tokenizer.encode(full_text)),
-        }}
+        }, "max_context": max_ctx}
 
     # ---- 共用工具 ----
 
@@ -414,46 +471,87 @@ class ModelManager:
         return "".join(parts)
 
     @staticmethod
-    async def _parse_thinking(delta, full_text, phase):
-        """解析 <thinking>...</thinking> 标签，按 2 字符一组推送"""
+    def _parse_tags(text):
+        """Find all thinking open/close tags in text, return sorted list."""
+        tags = []
+        for m in THINK_OPEN_RE.finditer(text):
+            tags.append((m.start(), m.end(), "thinking"))
+        for m in THINK_CLOSE_RE.finditer(text):
+            tags.append((m.start(), m.end(), "content"))
+        tags.sort()
+        return tags
+
+    @staticmethod
+    def _yield_chunked(text, phase):
+        """Yield text as 2-char events with correct type and phase."""
         CHUNK = 2
+        events = []
+        for i in range(0, len(text), CHUNK):
+            evt = {"type": phase, "content": text[i:i + CHUNK]}
+            if phase == "thinking":
+                evt["_phase"] = "thinking"
+            events.append(evt)
+        return events
 
-        if phase == "content":
-            idx = delta.find("<thinking>")
-            if idx != -1:
-                before = delta[:idx]
-                if before:
-                    for i in range(0, len(before), CHUNK):
-                        yield {"type": "content", "content": before[i:i + CHUNK]}
-                phase = "thinking"
-                think_part = delta[idx + len("<thinking>"):]
-                for i in range(0, len(think_part), CHUNK):
-                    yield {"type": "thinking", "content": think_part[i:i + CHUNK], "_phase": "thinking"}
-                return
+    @staticmethod
+    def _process_thinking(full_text, offset, phase):
+        """Parse <thinking>/<think tags in full_text[offset:], return (events, new_offset, new_phase)."""
+        unprocessed = full_text[offset:]
+        if not unprocessed:
+            return [], offset, phase
+
+        # Find tags in the FULL unprocessed text (not truncated)
+        tags = ModelManager._parse_tags(unprocessed)
+
+        if tags:
+            # Process up to and including the last complete tag
+            process_end = tags[-1][1]
+        else:
+            # No complete tag — check for a potential partial tag at the end
+            last_lt = unprocessed.rfind('<')
+            if (last_lt >= 0 and last_lt >= len(unprocessed) - 12
+                    and (unprocessed[last_lt:].startswith('<t')
+                         or unprocessed[last_lt:].startswith('</t')
+                         or unprocessed[last_lt:] in ('<', '</'))):
+                process_end = last_lt  # hold back the potential partial tag
             else:
-                for i in range(0, len(delta), CHUNK):
-                    yield {"type": "content", "content": delta[i:i + CHUNK]}
-                return
+                process_end = len(unprocessed)  # safe to process everything
+            tags = []
 
-        if phase == "thinking":
-            idx = delta.find("</thinking>")
-            if idx != -1:
-                think_part = delta[:idx]
-                if think_part:
-                    for i in range(0, len(think_part), CHUNK):
-                        yield {"type": "thinking", "content": think_part[i:i + CHUNK]}
-                content_part = delta[idx + len("</thinking>"):]
-                for i in range(0, len(content_part), CHUNK):
-                    yield {"type": "content", "content": content_part[i:i + CHUNK], "_phase": "thinking_done"}
-                return
-            else:
-                for i in range(0, len(delta), CHUNK):
-                    yield {"type": "thinking", "content": delta[i:i + CHUNK], "_phase": "thinking"}
-                return
+        scan_text = unprocessed[:process_end]
+        tags_in_range = [(s, e, p) for s, e, p in tags if e <= process_end]
 
-        # thinking_done
-        for i in range(0, len(delta), CHUNK):
-            yield {"type": "content", "content": delta[i:i + CHUNK], "_phase": "thinking_done"}
+        events = []
+        pos = 0
+        cur_phase = phase
+
+        for tag_start, tag_end, tag_phase in tags_in_range:
+            events.extend(ModelManager._yield_chunked(scan_text[pos:tag_start], cur_phase))
+            cur_phase = tag_phase
+            pos = tag_end
+
+        events.extend(ModelManager._yield_chunked(scan_text[pos:], cur_phase))
+        return events, offset + process_end, cur_phase
+
+    @staticmethod
+    def _flush_thinking(full_text, offset, phase):
+        """Flush remaining text at end of generation, parsing any remaining tags."""
+        unprocessed = full_text[offset:]
+        if not unprocessed:
+            return [], phase
+
+        tags = ModelManager._parse_tags(unprocessed)
+        events = []
+        pos = 0
+        cur_phase = phase
+
+        for tag_start, tag_end, tag_phase in tags:
+            events.extend(ModelManager._yield_chunked(unprocessed[pos:tag_start], cur_phase))
+            cur_phase = tag_phase
+            pos = tag_end
+
+        events.extend(ModelManager._yield_chunked(unprocessed[pos:], cur_phase))
+        return events, cur_phase
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +632,8 @@ async def health():
 @app.get("/api/models")
 async def list_models():
     return {"models": [
-        {"id": mid, "name": cfg["name"], "arch": cfg["arch"], "loaded": manager.is_loaded(mid)}
+        {"id": mid, "name": cfg["name"], "arch": cfg["arch"], "loaded": manager.is_loaded(mid),
+         "max_context": MAX_CONTEXT.get(cfg["arch"], 2048)}
         for mid, cfg in MODEL_CONFIGS.items()
     ]}
 
@@ -586,6 +685,7 @@ async def root():
 
 
 if _static_dir:
+    # no-cache: ensure browsers always revalidate HTML/JS (avoids stale model lists)
     app.mount("/", StaticFiles(directory=_static_dir, html=True), name="static")
 
 
@@ -599,9 +699,12 @@ def main():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--preload", action="store_true", help="启动时预加载所有模型")
+    parser.add_argument("--compile", action="store_true", help="启用 torch.compile 加速 (首次编译较慢)")
     args = parser.parse_args()
 
     import uvicorn
+
+    manager._compile_enabled = args.compile
 
     if args.preload:
         logger.info("预加载所有模型 ...")

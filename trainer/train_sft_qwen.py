@@ -225,20 +225,21 @@ def train_epoch(epoch, loader, steps_per_epoch, args, model, optimizer, scaler, 
 
         if (global_step % args.save_interval == 0 or step_in_epoch == steps_per_epoch):
             model.eval()
-            ckpt_dir = os.path.join(args.save_dir, f"checkpoint-{global_step}")
-            os.makedirs(ckpt_dir, exist_ok=True)
-            save_checkpoint(model, optimizer, scaler, epoch, global_step, ckpt_dir)
-            logger.info("Checkpoint saved to %s", ckpt_dir)
-            # Keep only 1 latest checkpoint
+            # Delete old checkpoints BEFORE saving new one (avoid disk full)
             ckpts = sorted(
                 [d for d in os.listdir(args.save_dir)
                  if d.startswith("checkpoint-") and os.path.isdir(os.path.join(args.save_dir, d))],
                 key=lambda d: int(d.split("-")[1])
             )
-            for old in ckpts[:-1]:
+            for old in ckpts:
                 import shutil
                 shutil.rmtree(os.path.join(args.save_dir, old))
                 logger.info("Removed old checkpoint: %s", old)
+            # Now save new checkpoint
+            ckpt_dir = os.path.join(args.save_dir, f"checkpoint-{global_step}")
+            os.makedirs(ckpt_dir, exist_ok=True)
+            save_checkpoint(model, optimizer, scaler, epoch, global_step, ckpt_dir)
+            logger.info("Checkpoint saved to %s", ckpt_dir)
             if tokenizer:
                 logger.info("--- Sample Generation (step %d) ---", global_step)
                 generate_sample(model, tokenizer, args.device,
@@ -270,7 +271,7 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--log_interval", type=int, default=20)
-    parser.add_argument("--save_interval", type=int, default=200)
+    parser.add_argument("--save_interval", type=int, default=2000)
     parser.add_argument("--max_seq_len", type=int, default=2048)
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1])

@@ -1,0 +1,13 @@
+{
+  "model": "Qwen2.5-0.5B",
+  "total_steps": 9000,
+  "epochs": 3,
+  "total_time_hours": 0.41,
+  "final_loss": 2.115617,
+  "config": {
+    "batch_size": 1,
+    "effective_batch": 32,
+    "learning_rate": 5e-06,
+    "model_path": "/root/blockdata/dpo_exp/qwen_b0.1_s42/final_model"
+  }
+}

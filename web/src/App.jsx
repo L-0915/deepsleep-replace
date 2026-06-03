@@ -6,8 +6,8 @@ import InputArea from './components/InputArea';
 import SettingsPanel from './components/SettingsPanel';
 import CompareMode from './components/CompareMode';
 import SleepAssessment from './components/SleepAssessment';
-import useChatStore from './hooks/useChat';
-import useModelStore from './hooks/useModel';
+import useChatStore, { estimateTokens } from './hooks/useChat';
+import useModelStore, { MODEL_MAX_CONTEXT } from './hooks/useModel';
 import { streamChat } from './utils/api';
 import { saveConversations } from './utils/storage';
 
@@ -21,16 +21,19 @@ export default function App() {
     newConversation,
     addMessage,
     updateLastMessage,
+    updateContextUsage,
     settings,
   } = useChatStore();
 
-  const { currentModel } = useModelStore();
+  const { currentModel, currentArch } = useModelStore();
   const [streamingMessage, setStreamingMessage] = useState(null);
   const [streamingThinking, setStreamingThinking] = useState(false);
   const abortRef = useRef(null);
 
   const currentConv = conversations.find(c => c.id === currentConversationId) || null;
   const messages = currentConv ? currentConv.messages : [];
+  const contextUsage = currentConv ? currentConv.contextUsage : null;
+  const maxContext = MODEL_MAX_CONTEXT[currentArch] || 2048;
 
   const handleSend = useCallback(async (text) => {
     // Ensure we have a conversation
@@ -94,6 +97,14 @@ export default function App() {
           setStreamingMessage(prev => prev ? { ...prev, content } : prev);
         } else if (event.type === 'done') {
           usage = event.usage;
+          // Update context usage for this conversation
+          if (event.usage) {
+            const maxCtx = event.max_context || MODEL_MAX_CONTEXT[currentArch] || 2048;
+            useChatStore.getState().updateContextUsage(convId, {
+              promptTokens: event.usage.prompt_tokens || 0,
+              maxContext: maxCtx,
+            });
+          }
         } else if (event.type === 'error') {
           content += `\n\n⚠️ ${event.content}`;
           setStreamingMessage(prev => prev ? { ...prev, content } : prev);
@@ -144,7 +155,7 @@ export default function App() {
           streamingThinking={streamingThinking}
           onQuickSend={handleSend}
         />
-        <InputArea onSend={handleSend} />
+        <InputArea onSend={handleSend} contextUsage={contextUsage} maxContext={maxContext} />
       </div>
 
       <SettingsPanel />

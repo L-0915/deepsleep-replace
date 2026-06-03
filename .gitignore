@@ -59,3 +59,5 @@ flagged/
 # Claude / internal
 .claude/
 .superpowers/
+out/sft_qwen_multiturn_b0.1/final_model/model.safetensors
+out/sft_qwen_multiturn_b0.5/final_model/model.safetensors

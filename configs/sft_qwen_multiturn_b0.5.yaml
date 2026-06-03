@@ -1,0 +1,23 @@
+# Qwen2.5-0.5B Multi-turn SFT (Phase 2, β=0.5)
+# Flow: Base → SFT → DPO(β=0.5) → 多轮SFT
+# Usage: python trainer/train_sft_qwen.py --config configs/sft_qwen_multiturn_b0.5.yaml
+
+data:
+  data_path: data/sft/xiaoxi/xiaoxi_sft_multiturn.jsonl
+
+training:
+  model_path: /root/blockdata/dpo_exp/qwen_b0.5_s42/final_model
+  save_dir: out/sft_qwen_multiturn_b0.5
+  epochs: 3
+  batch_size: 1
+  learning_rate: 5.0e-6
+  device: cuda:0
+  dtype: bfloat16
+  num_workers: 0
+  accumulation_steps: 32
+  max_seq_len: 2048
+  grad_clip: 1.0
+  log_interval: 20
+  save_interval: 2000
+  from_resume: 0
+  use_wandb: false

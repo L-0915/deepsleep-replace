@@ -6,6 +6,7 @@ import useModelStore from '../hooks/useModel';
 export default function Header() {
   const { sidebarOpen, setSidebarOpen, setSettingsOpen, settings, setSettings } = useChatStore();
   const { currentArch, currentBeta, setArch, setBeta } = useModelStore();
+  const archLabels = { deepsleep: 'DeepSleep', qwen: 'Qwen', qwen_mt: 'Qwen 多轮' };
   const [archDropdownOpen, setArchDropdownOpen] = useState(false);
   const [betaDropdownOpen, setBetaDropdownOpen] = useState(false);
   const archRef = useRef(null);
@@ -97,7 +98,7 @@ export default function Header() {
               fontSize: 14,
             }}
           >
-            {currentArch === 'deepsleep' ? 'DeepSleep' : 'Qwen'}
+            {archLabels[currentArch] || 'Qwen'}
             <ChevronDown size={14} />
           </button>
           {archDropdownOpen && (
@@ -116,7 +117,7 @@ export default function Header() {
                 boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
               }}
             >
-              {['deepsleep', 'qwen'].map(arch => (
+              {['deepsleep', 'qwen', 'qwen_mt'].map(arch => (
                 <button
                   key={arch}
                   onClick={() => { setArch(arch); setArchDropdownOpen(false); }}
@@ -132,7 +133,7 @@ export default function Header() {
                     fontSize: 14,
                   }}
                 >
-                  {arch === 'deepsleep' ? 'DeepSleep' : 'Qwen'}
+                  {archLabels[arch]}
                 </button>
               ))}
             </div>

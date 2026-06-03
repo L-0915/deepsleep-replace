@@ -19,9 +19,32 @@ function getTitle(content) {
   return text.slice(0, 24) + (text.length > 24 ? '...' : '') || '新对话';
 }
 
+/** Rough client-side token estimation: CJK ~2 chars/token, ASCII ~4 chars/token */
+export function estimateTokens(text) {
+  if (!text) return 0;
+  let cjk = 0, ascii = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if ((code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF) ||
+        (code >= 0x3000 && code <= 0x303F) || (code >= 0xFF00 && code <= 0xFFEF)) {
+      cjk++;
+    } else {
+      ascii++;
+    }
+  }
+  return Math.ceil(cjk / 1.5 + ascii / 4);
+}
+
 const useChatStore = create((set, get) => {
   const savedConversations = loadConversations();
   const savedSettings = loadSettings();
+
+  // Migrate old conversations to include contextUsage
+  for (const conv of savedConversations) {
+    if (!conv.contextUsage) {
+      conv.contextUsage = { promptTokens: 0, maxContext: 1800 };
+    }
+  }
 
   return {
     conversations: savedConversations,
@@ -46,6 +69,7 @@ const useChatStore = create((set, get) => {
         title: '新对话',
         messages: [],
         model: get().settings.currentModel || 'ds_b0.1',
+        contextUsage: { promptTokens: 0, maxContext: 1800 },
         createdAt: Date.now(),
       };
       const conversations = [conv, ...get().conversations];
@@ -106,6 +130,22 @@ const useChatStore = create((set, get) => {
         saveConversations(updated);
         set({ conversations: updated });
       }
+    },
+
+    updateContextUsage: (convId, usage) => {
+      const { conversations } = get();
+      const idx = conversations.findIndex(c => c.id === convId);
+      if (idx === -1) return;
+      const updated = [...conversations];
+      updated[idx] = {
+        ...updated[idx],
+        contextUsage: {
+          promptTokens: usage.promptTokens || 0,
+          maxContext: usage.maxContext || 1800,
+        },
+      };
+      saveConversations(updated);
+      set({ conversations: updated });
     },
 
     setSettings: (partial) => {
