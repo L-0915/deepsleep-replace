@@ -1,4 +1,4 @@
-# DeepSleep Continued Pretraining (CPT) — Medical QA
+## DeepSleep Continued Pretraining (CPT) — Medical QA
 # Usage: bash scripts/run/run_cpt.sh
 #        or: python trainer/train_cpt.py --config configs/cpt.yaml
 
